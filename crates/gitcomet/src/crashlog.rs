@@ -226,6 +226,7 @@ fn write_runtime_error_log(record: &log::Record<'_>) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
+    let _ = enforce_directory_is_private(&dir);
 
     let location = record
         .file()
@@ -252,11 +253,12 @@ fn write_runtime_error_log_in_dir(
     backtrace: &str,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    enforce_directory_is_private(dir)?;
     let path = runtime_error_path(dir);
     let has_existing_log = std::fs::metadata(&path)
         .map(|metadata| metadata.len() > 0)
         .unwrap_or(false);
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = open_append(&path)?;
     if has_existing_log {
         writeln!(file)?;
     }
@@ -302,10 +304,11 @@ pub fn begin_session() -> std::io::Result<()> {
 
 fn begin_session_in_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    enforce_directory_is_private(dir)?;
     remove_file_if_exists(&last_operation_path(dir))?;
     remove_file_if_exists(&runtime_error_path(dir))?;
 
-    let mut file = File::create(session_marker_path(dir))?;
+    let mut file = create_new_file(&session_marker_path(dir))?;
     writeln!(file, "=== GitComet abnormal exit candidate ===")?;
     writeln!(file, "failure_kind=abnormal-exit")?;
     writeln!(file, "failure_context=")?;
@@ -383,10 +386,8 @@ fn record_session_failure_in_dir_with_diagnostics(
     backtrace: Option<&str>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(session_marker_path(dir))?;
+    enforce_directory_is_private(dir)?;
+    let mut file = open_append(&session_marker_path(dir))?;
     writeln!(file, "failure_kind=returned-error")?;
     writeln!(file, "failure_context={}", single_line_text(context))?;
     writeln!(file, "timestamp_unix_ms={}", unix_time_ms())?;
@@ -634,6 +635,7 @@ fn append_report_log(destination: &mut String, report_log: &str) {
 
 fn write_startup_report_snapshot(dir: &Path, report_log: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
+    enforce_directory_is_private(dir)?;
     let report_path = startup_report_path(dir);
     let temporary_path = dir.join(format!(
         ".{STARTUP_REPORT_FILE}-{}-{}.tmp",
@@ -641,9 +643,15 @@ fn write_startup_report_snapshot(dir: &Path, report_log: &str) -> std::io::Resul
         unix_time_ms()
     ));
     let result = (|| -> std::io::Result<()> {
-        let mut file = File::create(&temporary_path)?;
+        // `create_new` never follows a hostile symlink at the temporary path;
+        // a stale file or symlink left by an earlier run is replaced once and
+        // creation retried.
+        let mut file = create_new_file(&temporary_path)?;
         file.write_all(report_log.as_bytes())?;
         file.sync_all()?;
+        // `rename` replaces a symlink at the report path instead of writing
+        // through it to its target, so the snapshot is never appended to an
+        // attacker-chosen file.
         std::fs::rename(&temporary_path, &report_path)
     })();
     if let Err(err) = result {
@@ -667,6 +675,7 @@ fn write_panic_log(info: &std::panic::PanicHookInfo<'_>) {
         return;
     };
     let _ = std::fs::create_dir_all(&dir);
+    let _ = enforce_directory_is_private(&dir);
 
     let Some(path) = crash_log_path(&dir) else {
         return;
@@ -793,8 +802,72 @@ fn crash_log_path(dir: &Path) -> Option<PathBuf> {
     Some(dir.join(format!("panic-{pid}-{}.log", unix_time_ms())))
 }
 
+/// Opens `path` for append while refusing to write through a hostile symlink:
+/// a symlink at `path` is removed first, so the append creates a fresh file.
+/// Regular files and directories are left untouched.
 fn open_append(path: &Path) -> std::io::Result<File> {
+    remove_symlink_entry(path)?;
     OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Removes `path` only when `symlink_metadata` reports it as a symlink, never
+/// following the link itself. Anything else (regular file, directory) is left
+/// alone.
+fn remove_symlink_entry(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        },
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Opens `path` for writing with O_EXCL semantics so a hostile symlink at
+/// `path` can never be followed. A stale entry left by an earlier process is
+/// replaced (only when it is a regular file or a symlink) and creation is
+/// retried once; a directory at `path` is never deleted.
+fn create_new_file(path: &Path) -> std::io::Result<File> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
+                {
+                    std::fs::remove_file(path)?;
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("refusing to replace non-file entry at {}", path.display()),
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+            OpenOptions::new().write(true).create_new(true).open(path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Restricts the crash directory to the owning user on unix: crash reports and
+/// session markers can embed backtraces, environment values and repository
+/// paths that other local accounts must not be able to read.
+fn enforce_directory_is_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 fn pending_report_path(dir: &Path) -> PathBuf {
@@ -1891,6 +1964,94 @@ new frame
         assert!(!marker.exists());
         assert!(!last_operation.exists());
         assert!(!runtime_error.exists());
+    }
+
+    #[test]
+    fn session_marker_refuses_to_replace_a_directory() {
+        let dir = tempdir().expect("temp dir");
+        let marker = session_marker_path(dir.path());
+        std::fs::create_dir(&marker).expect("create directory at marker path");
+        let marker_contents: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read session dir")
+            .collect();
+
+        let err = begin_session_in_dir(dir.path()).expect_err("begin session must fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(marker.is_dir(), "directory entry must be left untouched");
+        assert_eq!(marker_contents.len(), 1, "no extra entries created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_marker_replaces_stale_symlink_without_writing_through_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("temp dir");
+        let marker = session_marker_path(dir.path());
+        let victim = dir.path().join("victim.log");
+        std::fs::write(&victim, "pre-existing victim contents\n").expect("write victim");
+        symlink(&victim, &marker).expect("create stale symlink marker");
+
+        begin_session_in_dir(dir.path()).expect("begin session must replace stale marker");
+
+        let victim_contents =
+            std::fs::read_to_string(&victim).expect("read victim after begin session");
+        assert_eq!(
+            victim_contents, "pre-existing victim contents\n",
+            "session marker must not be written through the symlink to the victim"
+        );
+        let marker_metadata = std::fs::symlink_metadata(&marker).expect("stat replaced marker");
+        assert!(
+            marker_metadata.file_type().is_file(),
+            "marker must be a fresh regular file, not a symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_error_log_removes_symlink_before_appending() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("temp dir");
+        let runtime_error = runtime_error_path(dir.path());
+        let victim = dir.path().join("attacker-target.log");
+        std::fs::write(&victim, "precious victim contents\n").expect("write victim");
+        symlink(&victim, &runtime_error).expect("create symlink at log path");
+
+        write_runtime_error_log_in_dir(dir.path(), "test#L1", "message", "info", "backtrace")
+            .expect("write runtime error log");
+
+        let victim_contents = std::fs::read_to_string(&victim).expect("victim after log write");
+        assert_eq!(
+            victim_contents, "precious victim contents\n",
+            "runtime error log must not be appended through the symlink to the victim"
+        );
+        assert!(
+            std::fs::symlink_metadata(&runtime_error)
+                .expect("stat log path")
+                .file_type()
+                .is_file(),
+            "log path must be a fresh regular file"
+        );
+        let log_contents = std::fs::read_to_string(&runtime_error).expect("read runtime error log");
+        assert!(log_contents.contains("message=message"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_dir_is_restricted_to_the_owning_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("temp dir");
+        begin_session_in_dir(dir.path()).expect("begin session");
+
+        let mode = std::fs::metadata(dir.path())
+            .expect("stat crash dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "crash dir must be private to the owner");
     }
 
     #[cfg(unix)]

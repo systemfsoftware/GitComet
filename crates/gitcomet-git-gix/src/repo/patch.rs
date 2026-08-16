@@ -45,6 +45,15 @@ impl GixRepo {
         tmp_file
             .write_all(patch.as_bytes())
             .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
+        // Keep the pending patch text unreadable to other local users while it
+        // sits in the shared temp dir ahead of `git apply`. Named temp files
+        // are created 0600; assert the mode explicitly per the audit so no
+        // future tempfile/umask change can widen it.
+        #[cfg(unix)]
+        tmp_file
+            .as_file()
+            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
         let tmp_path = tmp_file.path();
 
         let mut cmd = self.git_workdir_cmd();
@@ -74,6 +83,15 @@ impl GixRepo {
         let mut tmp_file = NamedTempFile::new().map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
         tmp_file
             .write_all(patch.as_bytes())
+            .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
+        // Keep the pending patch text unreadable to other local users while it
+        // sits in the shared temp dir ahead of `git apply`. Named temp files
+        // are created 0600; assert the mode explicitly per the audit so no
+        // future tempfile/umask change can widen it.
+        #[cfg(unix)]
+        tmp_file
+            .as_file()
+            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
         let tmp_path = tmp_file.path();
 

@@ -103,6 +103,42 @@ fn write_copy_diagnostic(source: CopySource, text_len: usize, backend: Clipboard
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
+fn create_new_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    // O_EXCL semantics: a hostile symlink at `path` is never followed. A stale
+    // regular file or symlink from an earlier run is replaced once and the
+    // creation is retried; a directory at `path` is never deleted.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
+                {
+                    std::fs::remove_file(path)?;
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("refusing to replace non-file entry at {}", path.display()),
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
 fn write_copy_diagnostic_inner(
     source: CopySource,
     text_len: usize,
@@ -125,6 +161,10 @@ fn write_copy_diagnostic_inner(
         .join("gitcomet")
         .join("crashes");
     std::fs::create_dir_all(&dir)?;
+    // Crash diagnostics can embed repository paths; keep the directory out of
+    // other local users' reach.
+    #[cfg(unix)]
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
 
     let text = format!(
         "copy_source={}\ncopy_text_bytes={text_len}\ndisplay={}\nwayland_display={}\n\
@@ -138,7 +178,7 @@ fn write_copy_diagnostic_inner(
         },
     );
     let mut file =
-        std::fs::File::create(dir.join(format!("last-operation-{}.log", std::process::id())))?;
+        create_new_file(&dir.join(format!("last-operation-{}.log", std::process::id())))?;
     use std::io::Write as _;
     file.write_all(text.as_bytes())?;
     file.sync_data()

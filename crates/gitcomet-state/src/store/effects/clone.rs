@@ -11,6 +11,7 @@ use gitcomet_core::auth::{
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::process::git_command;
 use gitcomet_core::services::CommandOutput;
+use gitcomet_core::url_redact::{redact_remote_url_userinfo, validate_remote_url};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -27,7 +28,6 @@ const GIT_COMMAND_TIMEOUT_DEFAULT_SECS: u64 = 300;
 const GIT_COMMAND_WAIT_POLL: Duration = Duration::from_millis(100);
 const GITCOMET_ASKPASS_PROMPT_LOG_ENV: &str = "GITCOMET_ASKPASS_PROMPT_LOG";
 const GITCOMET_ASKPASS_PASSPHRASE_PROMPT_LOG_ENV: &str = "GITCOMET_ASKPASS_PASSPHRASE_PROMPT_LOG";
-const ALLOWED_CLONE_URL_SCHEMES: [&str; 4] = ["https", "ssh", "git", "file"];
 
 struct ActiveCloneHandle {
     cancel_requested: AtomicBool,
@@ -227,63 +227,9 @@ fn git_command_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(GIT_COMMAND_TIMEOUT_DEFAULT_SECS))
 }
 
-fn is_windows_drive_path(url: &str) -> bool {
-    let bytes = url.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-}
-
-fn explicit_url_scheme_end(url: &str) -> Option<usize> {
-    if is_windows_drive_path(url) {
-        return None;
-    }
-
-    let mut chars = url.char_indices();
-    let (_, first) = chars.next()?;
-    if !first.is_ascii_alphabetic() {
-        return None;
-    }
-
-    for (idx, ch) in chars {
-        if ch == ':' {
-            return Some(idx);
-        }
-        if !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')) {
-            return None;
-        }
-    }
-
-    None
-}
-
 fn validate_clone_url(url: &str) -> Result<(), Error> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err(Error::new(ErrorKind::Backend(
-            "clone URL cannot be empty".to_string(),
-        )));
-    }
-
-    let Some(scheme_end) = explicit_url_scheme_end(url) else {
-        return Ok(());
-    };
-
-    let scheme = url[..scheme_end].to_ascii_lowercase();
-    if !ALLOWED_CLONE_URL_SCHEMES.contains(&scheme.as_str()) {
-        return Err(Error::new(ErrorKind::Backend(format!(
-            "unsupported clone URL scheme `{scheme}` (allowed: https, ssh, git, file)"
-        ))));
-    }
-
-    if !url[scheme_end..].starts_with("://") {
-        return Err(Error::new(ErrorKind::Backend(format!(
-            "invalid clone URL format for `{scheme}`; expected `{scheme}://...`"
-        ))));
-    }
-
-    Ok(())
+    // Scheme gate lives in gitcomet-core so remote add/set-url share it.
+    validate_remote_url(url)
 }
 
 fn take_pending_git_auth() -> Option<PromptAuth> {
@@ -652,7 +598,13 @@ pub(super) fn schedule_clone_repo(
             }
         };
 
-        let command_str = format!("git clone --progress {} {}", url, dest.display());
+        // Display-only string: the real argv (cmd.arg(&url)) keeps the raw
+        // URL so git can use its userinfo; never echo it to logs/errors.
+        let command_str = format!(
+            "git clone --progress {} {}",
+            redact_remote_url_userinfo(&url),
+            dest.display()
+        );
 
         let child = match cmd.spawn() {
             Ok(child) => child,
