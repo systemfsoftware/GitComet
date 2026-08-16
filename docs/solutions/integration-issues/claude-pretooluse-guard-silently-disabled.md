@@ -76,7 +76,7 @@ Verified with a fixture that mirrors the *real* PreToolUse payload, not the gues
 
 ```bash
 echo '{"tool_name":"Bash","tool_input":{"command":"git worktree add ../foo"}}' \
-  | bun .claude/hooks/git-worktree-guard.ts   # exit 2, directive on stderr
+  | ./.claude/hooks/git-worktree-guard.ts   # exit 2, directive on stderr
 ```
 
 ## Prevention
@@ -87,3 +87,23 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git worktree add ../foo"}}' \
   literal-string containment (must pass), and empty/malformed stdin (must exit 0).
 - Treat a 5-second timeout as a lower-bound worry, not the contract: the harness kills
   a slow hook, and a killed hook is a silent pass. Keep hook bodies fast and fail loudly.
+
+## Runtime choice
+
+The guard's first version was a bun script. Wrong substrate: this machine's
+script convention is deno with exact scopes or plain bash (machine CLAUDE.md
+OP15/OP17), and a committed repo hook should not add a runtime collaborators
+may lack. Porting to deno exposed two more silent-exit traps, both observed
+this session on deno 2.9.5:
+
+1. `Deno.stdin.text()` does not exist — the TypeError landed in the JSON.parse
+   catch and exited 0 on every input. Read stdin with a chunked
+   `Deno.stdin.read()` loop.
+2. A PATH probe via `Deno.stat` needs `--allow-read`, and reading PATH needs
+   `--allow-env=PATH`; without them the probe throws inside its own catch and
+   the guard fails open invisibly.
+
+Gate for both: the Prevention matrix above (block, `git -C`, containment,
+empty stdin, plus a PATH-stripped run asserting fail-open) — every early exit
+is exercised, not just the intended ones. A catch that swallows a missing-API
+or permission error is indistinguishable from a decision to pass.
