@@ -818,7 +818,7 @@ impl SettingsWindowView {
             .as_deref()
             .and_then(ChangeTrackingView::from_key)
             .unwrap_or_default();
-        let respect_ide_watch_excludes = ui_session.respect_ide_watch_excludes.unwrap_or(true);
+        let respect_ide_watch_excludes = ui_session.respect_ide_watch_excludes_enabled();
         let terminal_preferences = TerminalPreferences::from_ui_session(&ui_session);
         let diff_scroll_sync = ui_session
             .diff_scroll_sync
@@ -7405,7 +7405,23 @@ mod tests {
                 .expect("settings window should be open")
         });
 
-        // T4.1: the setting starts enabled and is mirrored into the store.
+        // T4.1: the row renders (Change-tracking category) with the setting
+        // enabled and mirrored into the store.
+        let mut settings_cx = gpui::VisualTestContext::from_window(*settings_window.deref(), cx);
+        settings_cx.run_until_parked();
+        settings_cx.simulate_resize(size(px(SETTINGS_WINDOW_DEFAULT_WIDTH_PX), px(1200.0)));
+        settings_cx.run_until_parked();
+        let _ = settings_window.update(&mut settings_cx, |settings, _window, cx| {
+            settings.select_category(SettingsCategory::ChangeTracking, cx);
+            cx.notify();
+        });
+        settings_cx.run_until_parked();
+        settings_cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+        let row_bounds = settings_cx
+            .debug_bounds("settings_window_respect_ide_watch_excludes")
+            .expect("the respect-IDE-excludes toggle row should render its id");
         assert!(cx.update(|_window, app| {
             settings_window
                 .read_with(app, |settings, _cx| settings.respect_ide_watch_excludes)
@@ -7419,16 +7435,9 @@ mod tests {
                 .respect_ide_watch_excludes
         }));
 
-        // T4.2: the toggle handler flips the field, persists, and dispatches
-        // the message to the store.
-        cx.update(|_window, app| {
-            main_view.update(app, |_view, cx| {
-                let _ = settings_window.update(cx, |settings, _window, cx| {
-                    settings.set_respect_ide_watch_excludes(false, cx);
-                });
-            });
-        });
-        cx.run_until_parked();
+        // T4.2: CLICKING the rendered row flips the field, persists, and
+        // dispatches the message to the store (the handler call alone cannot
+        // pin the row wiring — review finding 5).
         let store_mirrored = |app: &App| {
             main_view
                 .read(app)
@@ -7436,6 +7445,8 @@ mod tests {
                 .snapshot()
                 .respect_ide_watch_excludes
         };
+        settings_cx.simulate_click(row_bounds.center(), Modifiers::default());
+        settings_cx.run_until_parked();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let mirrored = cx.update(|_window, app| store_mirrored(app));
@@ -7457,15 +7468,13 @@ mod tests {
             );
         });
 
-        // And back on: the store follows the last click.
-        cx.update(|_window, app| {
-            main_view.update(app, |_view, cx| {
-                let _ = settings_window.update(cx, |settings, _window, cx| {
-                    settings.set_respect_ide_watch_excludes(true, cx);
-                });
-            });
-        });
-        cx.run_until_parked();
+        // And back on: clicking the row again flips the field and the store
+        // follows the last click.
+        let row_bounds_after_off = settings_cx
+            .debug_bounds("settings_window_respect_ide_watch_excludes")
+            .expect("row should still render after the click");
+        settings_cx.simulate_click(row_bounds_after_off.center(), Modifiers::default());
+        settings_cx.run_until_parked();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let mirrored = cx.update(|_window, app| store_mirrored(app));
@@ -7476,7 +7485,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "the store must receive the toggle back on"
             );
-            cx.run_until_parked();
+            settings_cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }

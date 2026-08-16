@@ -381,7 +381,11 @@ impl RepoMonitorManager {
             return;
         };
         let Some(workdir) = active_workdir else {
-            self.excludes_enabled = None;
+            // The repo is still active but its workdir metadata is
+            // momentarily missing. Leave the cached setting alone: clearing
+            // it would make the next sync see a config change and
+            // force-restart the running monitor for nothing (review
+            // finding 7).
             return;
         };
         let config_changed = self.excludes_enabled != Some(respect_ide_watch_excludes);
@@ -396,6 +400,13 @@ impl RepoMonitorManager {
             respect_ide_watch_excludes,
         );
         self.excludes_enabled = Some(respect_ide_watch_excludes);
+    }
+
+    #[cfg(test)]
+    pub(super) fn monitor_thread_id(&self, repo_id: RepoId) -> Option<std::thread::ThreadId> {
+        self.handles
+            .get(&repo_id)
+            .map(|handle| handle.join.thread().id())
     }
 
     #[cfg(test)]
@@ -936,8 +947,14 @@ fn repo_monitor_thread(
     let idle_tick = Duration::from_secs(30);
 
     let mut debouncer = DebouncedChange::new(debounce, max_delay);
+    // Set when a config event reloaded the ignore rules; the watcher is
+    // rebuilt once when the pending change flushes (see the timeout arm).
+    let mut rules_rebuild_pending = false;
 
     let flush = |change: RepoExternalChange| {
+        if !monitor_enabled.load(Ordering::Relaxed) {
+            return;
+        }
         let active = active_repo_id.load(Ordering::Relaxed);
         if active == repo_id.0 {
             trace_repo_monitor_flush("flush", repo_id, change, active);
@@ -959,6 +976,9 @@ fn repo_monitor_thread(
         let Some(change) = pending else {
             return;
         };
+        if !monitor_enabled.load(Ordering::Relaxed) {
+            return;
+        }
         let active = active_repo_id.load(Ordering::Relaxed);
         if active == repo_id.0 {
             trace_repo_monitor_flush("flush_if_active", repo_id, change, active);
@@ -1040,35 +1060,19 @@ fn repo_monitor_thread(
                             }
                         }
                         if classified.rules_changed {
-                            // The watcher ignore rules changed (and
-                            // `classify_repo_event` already reloaded them), so
-                            // re-initiate the worktree watches from scratch by
-                            // rebuilding the watcher. Dropping the old watcher
-                            // releases all of its inotify watches, so directories
-                            // that just became ignored stop being watched (no more
-                            // churn) and ones that became un-ignored gain watches —
-                            // keeping the watched set minimal. The rebuilt watcher
-                            // is only swapped in if it sets up successfully, so a
-                            // transient failure never leaves us watcherless.
-                            if let Some((new_watcher, new_outcome)) = build_workdir_watcher(
-                                repo_id,
-                                &workdir,
-                                git_dir.as_deref(),
-                                &mut gitignore,
-                                &mut watcher_excludes,
-                                &mut watched_dirs,
-                                &monitor_tx,
-                                &monitor_enabled,
-                            ) {
-                                watcher = new_watcher;
-                                watch_outcome = new_outcome;
-                                note_watch_outcome(
-                                    &msg_tx,
-                                    repo_id,
-                                    &mut watch_degraded,
-                                    watch_outcome,
-                                );
-                            }
+                            // `classify_repo_event` already reloaded the rules in
+                            // place. Rebuild the watcher exactly once per debounce
+                            // window instead of once per event: a burst of
+                            // config-file saves coalesces into one rebuild and one
+                            // rules reload (review finding 1). The rebuild itself
+                            // runs when the pending change flushes (timeout arm),
+                            // so the reset happens at most max_delay after the last
+                            // config event.
+                            repo_load_trace::trace!(
+                                "repo_monitor_rules_rebuild_scheduled repo_id={:?}",
+                                repo_id
+                            );
+                            rules_rebuild_pending = true;
                         }
                     }
                     Err(_) => {
@@ -1084,7 +1088,37 @@ fn repo_monitor_thread(
                     break;
                 }
                 let now = Instant::now();
-                flush_if_active(debouncer.take_if_due(now));
+                let due = debouncer.take_if_due(now);
+                if due.is_some() {
+                    flush_if_active(due);
+                }
+                if rules_rebuild_pending {
+                    // The rules changed and their change flushed (or the flush
+                    // happened inline in the event arm); re-initiate the
+                    // worktree watches from scratch now. Dropping the old
+                    // watcher releases all of its inotify watches, so
+                    // directories that just became ignored stop being watched
+                    // (no more churn) and ones that became un-ignored gain
+                    // watches — keeping the watched set minimal. The rebuilt
+                    // watcher is only swapped in if it sets up successfully, so
+                    // a transient failure never leaves us watcherless — and the
+                    // flag stays set, retrying on the next flush.
+                    if let Some((new_watcher, new_outcome)) = build_workdir_watcher(
+                        repo_id,
+                        &workdir,
+                        git_dir.as_deref(),
+                        &mut gitignore,
+                        &mut watcher_excludes,
+                        &mut watched_dirs,
+                        &monitor_tx,
+                        &monitor_enabled,
+                    ) {
+                        watcher = new_watcher;
+                        watch_outcome = new_outcome;
+                        note_watch_outcome(&msg_tx, repo_id, &mut watch_degraded, watch_outcome);
+                        rules_rebuild_pending = false;
+                    }
+                }
                 // While watching is disabled because the worktree was over budget, an ignore edit in
                 // an unwatched subdirectory (which we cannot observe) may have brought it back under
                 // budget. Re-check on the idle tick — but throttled, since each re-check reloads the
@@ -1124,7 +1158,9 @@ fn repo_monitor_thread(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn is_ignored_dir(
+/// Whether `path` is skipped for directory watching: it is gitignored or falls
+/// under an IDE watcher-exclude rule (both rule sources gate the watch set).
+fn is_excluded_or_ignored_dir(
     workdir: &Path,
     gitignore: &mut GitignoreRules,
     watcher_excludes: &mut WatcherExcludes,
@@ -1134,15 +1170,21 @@ fn is_ignored_dir(
         || is_excluded_worktree_path_with_hint(workdir, watcher_excludes, path, Some(true))
 }
 
-/// Whether `path` falls under an IDE watcher-exclude rule; `None` on paths
-/// outside the worktree (never excluded).
+/// Worktree-relative projection of a watcher event path, or `None` outside the
+/// worktree (where ignore rules never apply).
+fn worktree_rel<'a>(workdir: &Path, path: &'a Path) -> Option<&'a Path> {
+    path.strip_prefix(workdir).ok()
+}
+
+/// Whether `path` falls under an IDE watcher-exclude rule; paths outside the
+/// worktree are never excluded.
 fn is_excluded_worktree_path_with_hint(
     workdir: &Path,
     watcher_excludes: &mut WatcherExcludes,
     path: &Path,
     is_dir_hint: Option<bool>,
 ) -> bool {
-    let Ok(rel) = path.strip_prefix(workdir) else {
+    let Some(rel) = worktree_rel(workdir, path) else {
         return false;
     };
     watcher_excludes.is_excluded(rel, is_dir_hint)
@@ -1189,7 +1231,7 @@ fn collect_watchable_dirs_capped(
     if is_git_related_path(workdir, git_dir, start) {
         return result;
     }
-    if start != workdir && is_ignored_dir(workdir, gitignore, watcher_excludes, start) {
+    if start != workdir && is_excluded_or_ignored_dir(workdir, gitignore, watcher_excludes, start) {
         return result;
     }
 
@@ -1215,7 +1257,7 @@ fn collect_watchable_dirs_capped(
             }
             let path = entry.path();
             if is_git_related_path(workdir, git_dir, &path)
-                || is_ignored_dir(workdir, gitignore, watcher_excludes, &path)
+                || is_excluded_or_ignored_dir(workdir, gitignore, watcher_excludes, &path)
             {
                 continue;
             }
@@ -1675,14 +1717,14 @@ fn classify_repo_event(
 
     // Detect (and reload on) ignore-config changes once, up front, so the result is reliable even on
     // a rescan event and the caller never needs a second scan or a second rules reload.
-    let gitignore_config_changed = event
-        .paths
-        .iter()
-        .any(|p| is_gitignore_config_path(workdir, git_dir, p));
-    let ide_excludes_config_changed = event
-        .paths
-        .iter()
-        .any(|p| is_ide_watcher_excludes_config_path(workdir, p));
+    let watcher_excludes_config = WatcherExcludes::config_path(workdir);
+    let (gitignore_config_changed, ide_excludes_config_changed) =
+        event.paths.iter().fold((false, false), |(git, ide), p| {
+            (
+                git || is_gitignore_config_path(workdir, git_dir, p),
+                ide || p == &watcher_excludes_config,
+            )
+        });
     let rules_changed = gitignore_config_changed || ide_excludes_config_changed;
     if gitignore_config_changed {
         *gitignore = GitignoreRules::load(workdir);
@@ -1696,13 +1738,6 @@ fn classify_repo_event(
         return ClassifiedEvent {
             change: Some(RepoExternalChange::all()),
             rules_changed,
-        };
-    }
-
-    if rules_changed {
-        return ClassifiedEvent {
-            change: Some(RepoExternalChange::worktree()),
-            rules_changed: true,
         };
     }
 
@@ -1742,15 +1777,30 @@ fn classify_repo_event(
         }
     }
 
-    let change = RepoExternalChange {
+    let classification = RepoExternalChange {
         worktree: saw_worktree,
         index: saw_index,
         git_state: saw_git_state,
         tags: saw_tags,
     };
+    let change = if rules_changed {
+        // A config-file change is itself a worktree change and must reach the
+        // store so the new rules are applied to the refresh; merge it with the
+        // sibling-path flags instead of returning early, so a batched event
+        // (config file + .git/HEAD + index) still reports git_state/index/tags
+        // (review finding 6).
+        Some(RepoExternalChange {
+            worktree: true,
+            index: classification.index,
+            git_state: classification.git_state,
+            tags: classification.tags,
+        })
+    } else {
+        (!classification.is_empty()).then_some(classification)
+    };
     ClassifiedEvent {
-        change: (!change.is_empty()).then_some(change),
-        rules_changed: false,
+        change,
+        rules_changed,
     }
 }
 
@@ -1844,19 +1894,15 @@ fn is_gitignore_config_path(workdir: &Path, git_dir: Option<&Path>, path: &Path)
     git_dir.is_some_and(|git_dir| path == git_dir.join("info").join("exclude"))
 }
 
-/// Whether `path` is the IDE watcher-excludes config file (`.vscode/settings.json` at the worktree
-/// root). Its own edits reload the exclude rules and rebuild the worktree watches (plan R4).
-fn is_ide_watcher_excludes_config_path(workdir: &Path, path: &Path) -> bool {
-    path == WatcherExcludes::config_path(workdir)
-}
-
+/// Whether `path` falls under a git-ignore rule; paths outside the worktree
+/// are never ignored (see [`worktree_rel`] for the projection).
 fn is_ignored_worktree_path_with_hint(
     workdir: &Path,
     gitignore: &mut GitignoreRules,
     path: &Path,
     is_dir_hint: Option<bool>,
 ) -> bool {
-    let Ok(rel) = path.strip_prefix(workdir) else {
+    let Some(rel) = worktree_rel(workdir, path) else {
         return false;
     };
     gitignore.is_ignored_rel(rel, is_dir_hint)
@@ -3760,6 +3806,123 @@ mod tests {
             ),
             None,
             "IDE excludes apply even to tracked files (T2.7/AE6)"
+        );
+    }
+
+    #[test]
+    fn dir_only_excludes_drop_file_typed_create_events() {
+        // Review finding 4: a Create(File) under a dir-only-excluded subtree
+        // must be dropped too — the ancestor directory match applies even when
+        // the event itself is file-typed.
+        let dir = unique_temp_dir("gitcomet-monitor-ide-excludes");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join("repos")).expect("create repos");
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {"repos/": true}}"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut rules = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, true);
+
+        let created_file = notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![workdir.join("repos").join("new.txt")],
+            attrs: Default::default(),
+        };
+        assert_eq!(
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut excludes,
+                &created_file
+            ),
+            None,
+            "file-typed events under a dir-only-excluded subtree must not refresh"
+        );
+
+        // A file created OUTSIDE the excluded dir still refreshes.
+        let outside_file = notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![workdir.join("src").join("new.txt")],
+            attrs: Default::default(),
+        };
+        assert!(
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut excludes,
+                &outside_file
+            )
+            .is_some(),
+            "files outside excluded dirs keep refreshing"
+        );
+    }
+
+    #[test]
+    fn config_change_preserves_git_state_flags_in_mixed_events() {
+        // Review finding 6: a batched event containing the config file AND a
+        // git-state path must report the git_state flag, not just the
+        // rules-change worktree refresh.
+        let dir = unique_temp_dir("gitcomet-monitor-ide-excludes");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {"repos/": true}}"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut rules = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, true);
+
+        let mixed = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![
+                workdir.join(".vscode").join("settings.json"),
+                workdir.join(".git").join("HEAD"),
+            ],
+            attrs: Default::default(),
+        };
+        let classified = classify_repo_event(
+            &workdir,
+            git_dir.as_deref(),
+            &mut rules,
+            &mut excludes,
+            &mixed,
+        );
+        assert!(classified.rules_changed, "config path must flag a reload");
+        let change = classified
+            .change
+            .expect("a rules change must always refresh");
+        assert!(change.worktree, "config change refreshes the worktree");
+        assert!(
+            change.git_state,
+            "the git-state contribution of a mixed event must survive"
+        );
+
+        // The rules are reloaded in place: the sibling worktree file that was
+        // just excluded by the same config edit no longer refreshes.
+        let excluded_after_reload = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![workdir.join("repos").join("file.txt")],
+            attrs: Default::default(),
+        };
+        assert_eq!(
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut excludes,
+                &excluded_after_reload
+            ),
+            None
         );
     }
 }

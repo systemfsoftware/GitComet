@@ -1,4 +1,6 @@
-use crate::model::{AppState, DefaultTagType, GitLogTagFetchMode, RepoId};
+use crate::model::{
+    AppState, DEFAULT_RESPECT_IDE_WATCH_EXCLUDES, DefaultTagType, GitLogTagFetchMode, RepoId,
+};
 use gitcomet_core::domain::{HistoryMode, LogScope};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -74,6 +76,16 @@ pub struct UiSession {
     pub default_tag_type: Option<DefaultTagType>,
     pub git_executable_path: Option<PathBuf>,
     pub external_code_editor: Option<ExternalCodeEditorSetting>,
+}
+
+impl UiSession {
+    /// Whether IDE watcher excludes are respected, defaulting to enabled when
+    /// the session has no stored value. Single resolution point for the
+    /// setting's default so UI entry points cannot drift (review finding 15).
+    pub fn respect_ide_watch_excludes_enabled(&self) -> bool {
+        self.respect_ide_watch_excludes
+            .unwrap_or(DEFAULT_RESPECT_IDE_WATCH_EXCLUDES)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

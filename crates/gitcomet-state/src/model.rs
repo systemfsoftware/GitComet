@@ -562,6 +562,10 @@ impl<T: Clone + PartialEq> NavStack<T> {
 
 // ── App state ───────────────────────────────────────────────────
 
+/// Default for [`AppState::respect_ide_watch_excludes`]. Single source of the
+/// default-enabled choice so the UI layer and the state layer cannot drift.
+pub const DEFAULT_RESPECT_IDE_WATCH_EXCLUDES: bool = true;
+
 #[derive(Clone, Debug)]
 pub struct AppState {
     pub repos: Vec<RepoState>,
@@ -602,7 +606,7 @@ impl Default for AppState {
             git_log_settings: GitLogSettings::default(),
             sidebar_mode: SidebarMode::default(),
             default_tag_type: DefaultTagType::default(),
-            respect_ide_watch_excludes: true,
+            respect_ide_watch_excludes: DEFAULT_RESPECT_IDE_WATCH_EXCLUDES,
         }
     }
 }

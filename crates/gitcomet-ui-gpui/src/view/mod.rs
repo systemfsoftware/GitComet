@@ -1422,7 +1422,7 @@ impl GitCometView {
             tag_fetch_mode: history_tag_fetch_mode,
         });
         store.dispatch(Msg::SetDefaultTagType(default_tag_type));
-        let respect_ide_watch_excludes = ui_session.respect_ide_watch_excludes.unwrap_or(true);
+        let respect_ide_watch_excludes = ui_session.respect_ide_watch_excludes_enabled();
         store.dispatch(Msg::SetRespectIdeWatcherExcludesEnabled(
             respect_ide_watch_excludes,
         ));

@@ -24,8 +24,9 @@ use std::path::{Path, PathBuf};
 
 use super::repo_load_trace;
 
-/// Path of the VS Code settings file, relative to the worktree root.
-const VSCODE_SETTINGS_REL: [&str; 2] = [".vscode", "settings.json"];
+/// Directory and file of the VS Code settings inside the worktree.
+const VSCODE_SETTINGS_DIR: &str = ".vscode";
+const VSCODE_SETTINGS_FILE: &str = "settings.json";
 
 /// One compiled `files.watcherExclude` entry.
 #[derive(Debug)]
@@ -126,39 +127,62 @@ fn path_segments(rel: &Path) -> Vec<&str> {
         .collect()
 }
 
-/// Whether `pattern` excludes `rel` — the path itself or any ancestor
-/// directory (a matched directory excludes its whole subtree).
-fn pattern_excludes(pattern: &ExcludePattern, rel: &Path, is_dir_hint: Option<bool>) -> bool {
-    if pattern.dir_only && is_dir_hint == Some(false) {
-        return false;
-    }
-
+/// Segment lists for `rel` and every ancestor directory, in
+/// [self, parent, grandparent, …] order. Computed once per exclusion check so
+/// the hot per-event path does not re-allocate per pattern.
+fn ancestor_segment_lists(rel: &Path) -> Vec<Vec<&str>> {
+    let mut lists = Vec::new();
     let mut candidate: Option<&Path> = Some(rel);
     while let Some(current) = candidate {
+        lists.push(path_segments(current));
+        candidate = current.parent();
+    }
+    lists
+}
+
+/// Whether `pattern` excludes `rel` — the path itself or any ancestor
+/// directory (a matched directory excludes its whole subtree).
+fn pattern_excludes(
+    pattern: &ExcludePattern,
+    candidates: &[Vec<&str>],
+    is_dir_hint: Option<bool>,
+) -> bool {
+    for (index, segments) in candidates.iter().enumerate() {
+        // `index == 0` is the event path itself; the rest are ancestor
+        // directories, which are directories by construction. A directory-only
+        // pattern can therefore never match against the event path when the
+        // hint says it is a file — but it can match the ancestors, whose
+        // subtree exclusion covers the file (plan R2, finding 4).
+        let is_self = index == 0;
         if pattern.any_depth {
             // No `/` in the pattern: it is a single segment that matches any
-            // depth, and an intermediate match excludes the subtree.
+            // depth, and an intermediate match excludes the subtree. (A
+            // directory-only pattern always carries a trailing `/`, which
+            // anchors it — so `dir_only` cannot combine with `any_depth`.)
             let Some(segment) = pattern.segments.first().and_then(|s| s.as_ref()) else {
-                return false;
+                // Bare `**`: zero or more segments at any depth — it matches
+                // every path (a matching directory excludes its subtree).
+                return true;
             };
-            if path_segments(current)
-                .iter()
-                .any(|part| segment.matches(part))
-            {
+            if segments.iter().any(|part| segment.matches(part)) {
                 return true;
             }
-        } else if path_matches(&pattern.segments, &path_segments(current)) {
+        } else if path_matches(&pattern.segments, segments) {
+            if pattern.dir_only && is_dir_hint == Some(false) && is_self {
+                // The pattern covers the whole event path, which is a file:
+                // a directory-only pattern does not apply to it.
+                continue;
+            }
             return true;
         } else if is_dir_hint != Some(false)
             && let Some(trimmed) = zero_segment_trim(&pattern.segments)
-            && path_matches(trimmed, &path_segments(current))
+            && path_matches(trimmed, segments)
         {
             // `dist/**` excludes `dist` itself (zero-segment `**` in the
             // trailing position). A file hint is not enough for the trimmed
             // prefix alone.
             return true;
         }
-        candidate = current.parent();
     }
     false
 }
@@ -188,9 +212,7 @@ impl WatcherExcludes {
 
     /// Path of the config file this rule set reads from.
     pub(crate) fn config_path(workdir: &Path) -> PathBuf {
-        workdir
-            .join(VSCODE_SETTINGS_REL[0])
-            .join(VSCODE_SETTINGS_REL[1])
+        workdir.join(VSCODE_SETTINGS_DIR).join(VSCODE_SETTINGS_FILE)
     }
 
     /// Whether the rule set is active (the monitor was started with the setting
@@ -212,13 +234,14 @@ impl WatcherExcludes {
         if matches!(
             first,
             Some(std::path::Component::Normal(part))
-                if part == std::ffi::OsStr::new(VSCODE_SETTINGS_REL[0])
+                if part == std::ffi::OsStr::new(VSCODE_SETTINGS_DIR)
         ) {
             return false;
         }
+        let candidates = ancestor_segment_lists(rel);
         self.patterns
             .iter()
-            .any(|pattern| pattern_excludes(pattern, rel, is_dir_hint))
+            .any(|pattern| pattern_excludes(pattern, &candidates, is_dir_hint))
     }
 }
 
@@ -231,7 +254,13 @@ fn parse_vscode_watcher_exclude(workdir: &Path) -> Option<Vec<ExcludePattern>> {
     let path = WatcherExcludes::config_path(workdir);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            repo_load_trace::trace!(
+                "watcher_excludes: {} not found — treating as empty",
+                path.display()
+            );
+            return Some(Vec::new());
+        }
         Err(error) => {
             repo_load_trace::trace!(
                 "watcher_excludes: could not read {}: {error} — treating as empty",
@@ -254,6 +283,10 @@ fn parse_vscode_watcher_exclude(workdir: &Path) -> Option<Vec<ExcludePattern>> {
         .get("files.watcherExclude")
         .and_then(serde_json::Value::as_object)
     else {
+        repo_load_trace::trace!(
+            "watcher_excludes: {} has no `files.watcherExclude` object — treating as empty",
+            path.display()
+        );
         return Some(Vec::new());
     };
 
@@ -270,7 +303,6 @@ fn parse_vscode_watcher_exclude(workdir: &Path) -> Option<Vec<ExcludePattern>> {
             Some(trimmed) => (trimmed, true),
             None => (glob.as_str(), false),
         };
-        let any_depth = !glob_contains_slash(glob, dir_only);
         if has_unsupported_syntax(glob) {
             repo_load_trace::trace!(
                 "watcher_excludes: pattern {:?} in {} uses unsupported syntax and is ignored",
@@ -280,7 +312,19 @@ fn parse_vscode_watcher_exclude(workdir: &Path) -> Option<Vec<ExcludePattern>> {
             continue;
         }
         let segments = split_segments(glob);
-        if segments.is_empty() {
+        let any_depth = !glob_contains_slash(glob, dir_only);
+        if segments.is_empty()
+            || segments
+                .iter()
+                .all(|segment| segment.as_ref().is_some_and(|c| c.text.is_empty()))
+        {
+            // `"/"` (or a run of slashes) compiles to empty literal
+            // segments, which never match a real path component.
+            repo_load_trace::trace!(
+                "watcher_excludes: pattern {:?} in {} is empty and is ignored",
+                glob,
+                path.display()
+            );
             continue;
         }
         patterns.push(ExcludePattern {
@@ -299,17 +343,25 @@ fn glob_contains_slash(glob: &str, had_trailing_slash: bool) -> bool {
 }
 
 fn split_segments(glob: &str) -> Vec<Option<CompiledSegment>> {
-    glob.split('/')
-        .map(|segment| {
-            if segment == "**" {
-                None
-            } else {
-                Some(CompiledSegment {
-                    text: segment.to_string(),
-                })
+    // Consecutive `**` are collapsed: zero-or-more segments is idempotent, so
+    // `**/**` behaves identically to `**` while keeping matching linear in the
+    // number of segments (finding 9).
+    let mut segments = Vec::new();
+    let mut prev_globstar = false;
+    for segment in glob.split('/') {
+        if segment == "**" {
+            if !prev_globstar {
+                segments.push(None);
+                prev_globstar = true;
             }
-        })
-        .collect()
+        } else {
+            segments.push(Some(CompiledSegment {
+                text: segment.to_string(),
+            }));
+            prev_globstar = false;
+        }
+    }
+    segments
 }
 
 #[cfg(test)]
@@ -515,5 +567,50 @@ mod tests {
         assert!(excludes.is_excluded(rel("target"), Some(true)));
         assert!(excludes.is_excluded(rel("target/debug"), Some(true)));
         assert!(excludes.is_excluded(rel("target/debug/deps/foo"), None));
+    }
+
+    #[test]
+    fn dir_only_pattern_excludes_file_events_below_the_directory() {
+        let dir = temp_workdir();
+        write_settings(dir.path(), r#"{"files.watcherExclude": {"repos/": true}}"#);
+        let excludes = WatcherExcludes::load(dir.path(), true);
+        // The excluded directory's own subtree is excluded even when the
+        // event hint says the event path is a file (review finding 4).
+        assert!(excludes.is_excluded(rel("repos/x.txt"), Some(false)));
+        assert!(excludes.is_excluded(rel("repos/a/b/file.rs"), Some(false)));
+        // But a FILE named like the directory is not the directory.
+        assert!(!excludes.is_excluded(rel("repos"), Some(false)));
+    }
+
+    #[test]
+    fn bare_double_star_excludes_everything() {
+        let dir = temp_workdir();
+        write_settings(dir.path(), r#"{"files.watcherExclude": {"**": true}}"#);
+        let excludes = WatcherExcludes::load(dir.path(), true);
+        assert!(excludes.is_excluded(rel("anything"), Some(true)));
+        assert!(excludes.is_excluded(rel("a/b/c/file.rs"), Some(false)));
+        // The `.vscode` carve-out still wins for the config file itself.
+        assert!(!excludes.is_excluded(rel(".vscode/settings.json"), Some(false)));
+    }
+
+    #[test]
+    fn consecutive_double_stars_collapse() {
+        let dir = temp_workdir();
+        write_settings(
+            dir.path(),
+            r#"{"files.watcherExclude": {"**/**/**/node_modules": true}}"#,
+        );
+        let excludes = WatcherExcludes::load(dir.path(), true);
+        assert!(excludes.is_excluded(rel("node_modules"), Some(true)));
+        assert!(excludes.is_excluded(rel("a/b/c/node_modules/package"), Some(false)));
+        assert!(!excludes.is_excluded(rel("a/b/c/lib"), Some(true)));
+    }
+
+    #[test]
+    fn bare_slash_pattern_is_ignored() {
+        let dir = temp_workdir();
+        write_settings(dir.path(), r#"{"files.watcherExclude": {"/": true}}"#);
+        let excludes = WatcherExcludes::load(dir.path(), true);
+        assert!(!excludes.is_excluded(rel("anything"), Some(true)));
     }
 }

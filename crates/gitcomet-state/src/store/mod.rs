@@ -196,23 +196,21 @@ where
 
     // Keep filesystem monitoring scoped to the active repository only, to minimize
     // OS watcher load in large multi-repo sessions.
-    let (active_repo, active_workdir) = {
+    let (active_repo, active_workdir, respect_ide_watch_excludes) = {
         let state = ctx.thread_state.read().unwrap_or_else(|e| e.into_inner());
-        let active_repo = state.active_repo;
-        let active_workdir = active_repo.and_then(|repo_id| {
+        let active_workdir = state.active_repo.and_then(|repo_id| {
             state
                 .repos
                 .iter()
                 .find(|r| r.id == repo_id)
                 .map(|r| r.spec.workdir.clone())
         });
-        (active_repo, active_workdir)
+        (
+            state.active_repo,
+            active_workdir,
+            state.respect_ide_watch_excludes,
+        )
     };
-    let respect_ide_watch_excludes = ctx
-        .thread_state
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .respect_ide_watch_excludes;
     // Only start a monitor for a repo the backend map actually holds; the state
     // may know the workdir before the repo is registered with the executor.
     let active_repo = active_repo.filter(|repo_id| ctx.repos.contains_key(repo_id));
