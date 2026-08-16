@@ -26,13 +26,13 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       with:
         components: rustfmt
     - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
     - name: Check formatting
       run: cargo fmt --all --check
 
@@ -41,31 +41,33 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
     - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
     - name: Run cargo-audit
       run: |
-        cargo audit \
-          --ignore RUSTSEC-2025-0052 \
-          --ignore RUSTSEC-2024-0384 \
-          --ignore RUSTSEC-2024-0436 \
-          --ignore RUSTSEC-2025-0134
+        IGNORES=(
+          RUSTSEC-2025-0052 # unmaintained-status advisory: async-std discontinued; transitive only, no CVE/exploit path (verified via rustsec.org 2026-08-16)
+          RUSTSEC-2024-0384 # unmaintained-status advisory: crate instant (unmaintained; transitive)
+          RUSTSEC-2024-0436 # unmaintained-status advisory: crate paste (unmaintained; transitive)
+          RUSTSEC-2025-0134 # unmaintained-status advisory: crate rustls-pemfile (unmaintained; transitive)
+        )
+        cargo audit "${IGNORES[@]/#/--ignore }"
 
   clippy:
     name: Clippy
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
     - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
     - name: Clippy (core + state + git backends)
       run: cargo clippy -p gitcomet-core -p gitcomet-state -p gitcomet-git -p gitcomet-git-gix -- -D warnings
     - name: Clippy (GPUI UI crate -- intentionally skipped on headless CI)
@@ -80,11 +82,11 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
     - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
     - name: Build (core + state + backend)
       run: cargo build -p gitcomet-core -p gitcomet-state -p gitcomet-git-gix --verbose
     - name: Build (app — headless)
@@ -97,11 +99,11 @@ jobs:
     timeout-minutes: 60
     needs: build
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
     - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
     - name: t6403/t6427 merge algorithm portability
       run: cargo test -p gitcomet-core --test merge_algorithm --verbose
     - name: Conflict label formatting (Phase 1C)
@@ -120,11 +122,11 @@ jobs:
     timeout-minutes: 60
     needs: build
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
     - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
     - name: KDiff3-style fixture harness (Phase 2)
       run: cargo test -p gitcomet-core --test merge_fixture_harness --verbose
     - name: Permutation corpus (Phase 3A — 243 sampled cases)
@@ -139,11 +141,11 @@ jobs:
     timeout-minutes: 60
     needs: build
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
     - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
     - name: Build gitcomet binary (headless)
       run: cargo build -p gitcomet $APP_FEATURES
     - name: Git mergetool E2E (Phase 4A — t7610 parity)
@@ -162,11 +164,11 @@ jobs:
     timeout-minutes: 60
     needs: build
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
     - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
     - name: Git CLI migration scoreboard
       run: cargo test -p gitcomet-git-gix --test git_cli_scoreboard -- --nocapture
     - name: Status and mergetool backend integration
