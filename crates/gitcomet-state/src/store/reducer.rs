@@ -2384,10 +2384,7 @@ mod nav_history_tests {
             state.respect_ide_watch_excludes,
             "the default state must respect IDE watcher excludes"
         );
-        dispatch(
-            &mut state,
-            Msg::SetRespectIdeWatcherExcludesEnabled(false),
-        );
+        dispatch(&mut state, Msg::SetRespectIdeWatcherExcludesEnabled(false));
         assert!(!state.respect_ide_watch_excludes);
         assert_eq!(state.notifications.len(), 0, "no side effects");
         dispatch(&mut state, Msg::SetRespectIdeWatcherExcludesEnabled(true));

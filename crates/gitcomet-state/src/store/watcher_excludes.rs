@@ -28,6 +28,7 @@ use super::repo_load_trace;
 const VSCODE_SETTINGS_REL: [&str; 2] = [".vscode", "settings.json"];
 
 /// One compiled `files.watcherExclude` entry.
+#[derive(Debug)]
 struct ExcludePattern {
     /// Compiled segments; `None` segments are `**`.
     segments: Vec<Option<CompiledSegment>>,
@@ -140,7 +141,10 @@ fn pattern_excludes(pattern: &ExcludePattern, rel: &Path, is_dir_hint: Option<bo
             let Some(segment) = pattern.segments.first().and_then(|s| s.as_ref()) else {
                 return false;
             };
-            if path_segments(current).iter().any(|part| segment.matches(part)) {
+            if path_segments(current)
+                .iter()
+                .any(|part| segment.matches(part))
+            {
                 return true;
             }
         } else if path_matches(&pattern.segments, &path_segments(current)) {
@@ -162,18 +166,10 @@ fn pattern_excludes(pattern: &ExcludePattern, rel: &Path, is_dir_hint: Option<bo
 /// The watcher-exclude rule set for one repository worktree.
 ///
 /// Immutable after load; the monitor reloads it when the config file changes.
+#[derive(Debug, Default)]
 pub(crate) struct WatcherExcludes {
     enabled: bool,
     patterns: Vec<ExcludePattern>,
-}
-
-impl Default for WatcherExcludes {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            patterns: Vec::new(),
-        }
-    }
 }
 
 impl WatcherExcludes {
@@ -182,19 +178,19 @@ impl WatcherExcludes {
     /// `enabled` gates the whole mechanism: a disabled rule set is empty and
     /// never reads the config file.
     pub(crate) fn load(workdir: &Path, enabled: bool) -> Self {
-        let mut excludes = Self::default();
-        excludes.enabled = enabled;
-        if enabled
-            && let Some(patterns) = parse_vscode_watcher_exclude(workdir)
-        {
-            excludes.patterns = patterns;
-        }
-        excludes
+        let patterns = if enabled {
+            parse_vscode_watcher_exclude(workdir).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Self { enabled, patterns }
     }
 
     /// Path of the config file this rule set reads from.
     pub(crate) fn config_path(workdir: &Path) -> PathBuf {
-        workdir.join(VSCODE_SETTINGS_REL[0]).join(VSCODE_SETTINGS_REL[1])
+        workdir
+            .join(VSCODE_SETTINGS_REL[0])
+            .join(VSCODE_SETTINGS_REL[1])
     }
 
     /// Whether the rule set is active (the monitor was started with the setting
@@ -488,7 +484,10 @@ mod tests {
     #[test]
     fn disabled_is_empty_even_with_rules() {
         let dir = temp_workdir();
-        write_settings(dir.path(), r#"{"files.watcherExclude": {"node_modules": true}}"#);
+        write_settings(
+            dir.path(),
+            r#"{"files.watcherExclude": {"node_modules": true}}"#,
+        );
         let excludes = WatcherExcludes::load(dir.path(), false);
         assert!(!excludes.is_excluded(rel("node_modules"), Some(true)));
     }
@@ -497,7 +496,10 @@ mod tests {
     fn vscode_directory_is_never_excluded() {
         let dir = temp_workdir();
         // A pattern that would otherwise swallow `.vscode` itself.
-        write_settings(dir.path(), r#"{"files.watcherExclude": {"**/.vscode": true}}"#);
+        write_settings(
+            dir.path(),
+            r#"{"files.watcherExclude": {"**/.vscode": true}}"#,
+        );
         let excludes = WatcherExcludes::load(dir.path(), true);
         assert!(!excludes.is_excluded(rel(".vscode"), Some(true)));
         assert!(!excludes.is_excluded(rel(".vscode/settings.json"), Some(false)));

@@ -1734,12 +1734,7 @@ fn classify_repo_event(
             }
         } else {
             if is_ignored_worktree_path_with_hint(workdir, gitignore, path, is_dir_hint)
-                || is_excluded_worktree_path_with_hint(
-                    workdir,
-                    watcher_excludes,
-                    path,
-                    is_dir_hint,
-                )
+                || is_excluded_worktree_path_with_hint(workdir, watcher_excludes, path, is_dir_hint)
             {
                 continue;
             }
@@ -2194,7 +2189,13 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, Some(&workdir.join(".git")), &mut rules, &mut WatcherExcludes::default(), &event),
+            classify_change(
+                &workdir,
+                Some(&workdir.join(".git")),
+                &mut rules,
+                &mut WatcherExcludes::default(),
+                &event
+            ),
             Some(RepoExternalChange::Worktree),
             "ignoring index.lock should still classify real worktree changes"
         );
@@ -2343,7 +2344,13 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &event),
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut WatcherExcludes::default(),
+                &event
+            ),
             None
         );
     }
@@ -2378,7 +2385,13 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &tracked_event),
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut WatcherExcludes::default(),
+                &tracked_event
+            ),
             Some(RepoExternalChange::Worktree)
         );
 
@@ -2388,7 +2401,13 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &ignored_event),
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut WatcherExcludes::default(),
+                &ignored_event
+            ),
             None
         );
     }
@@ -2404,7 +2423,13 @@ mod tests {
         let git_dir = resolve_git_dir(&workdir);
         let mut gitignore = GitignoreRules::load(&workdir);
 
-        let dirs = collect_watchable_dirs(&workdir, &workdir, git_dir.as_deref(), &mut gitignore, &mut WatcherExcludes::default());
+        let dirs = collect_watchable_dirs(
+            &workdir,
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut WatcherExcludes::default(),
+        );
 
         assert!(dirs.contains(&workdir), "workdir root must be watched");
         assert!(
@@ -2698,7 +2723,16 @@ mod tests {
         let mut watched_dirs: HashSet<PathBuf> = HashSet::default();
 
         // vendor/ is not yet ignored, so the initial setup watches it.
-        let (_initial, _) = build_workdir_watcher(RepoId(1), &workdir, git_dir.as_deref(), &mut gitignore, &mut WatcherExcludes::default(), &mut watched_dirs, &monitor_tx, &monitor_enabled)
+        let (_initial, _) = build_workdir_watcher(
+            RepoId(1),
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut WatcherExcludes::default(),
+            &mut watched_dirs,
+            &monitor_tx,
+            &monitor_enabled,
+        )
         .expect("initial watcher build must succeed");
         assert!(
             watched_dirs.contains(&workdir.join("vendor")),
@@ -2710,7 +2744,16 @@ mod tests {
         // below) releases its watches.
         fs::write(workdir.join(".gitignore"), "vendor/\n").expect("write .gitignore");
         gitignore = GitignoreRules::load(&workdir);
-        let (_watcher, _) = build_workdir_watcher(RepoId(1), &workdir, git_dir.as_deref(), &mut gitignore, &mut WatcherExcludes::default(), &mut watched_dirs, &monitor_tx, &monitor_enabled)
+        let (_watcher, _) = build_workdir_watcher(
+            RepoId(1),
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut WatcherExcludes::default(),
+            &mut watched_dirs,
+            &monitor_tx,
+            &monitor_enabled,
+        )
         .expect("rebuilt watcher must succeed");
         drop(_initial);
         assert!(
@@ -3118,7 +3161,13 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &empty_paths),
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut WatcherExcludes::default(),
+                &empty_paths
+            ),
             Some(RepoExternalChange::Both)
         );
 
@@ -3128,7 +3177,13 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &git_head),
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut WatcherExcludes::default(),
+                &git_head
+            ),
             Some(RepoExternalChange::GitState)
         );
 
@@ -3138,7 +3193,13 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &gitignore_changed),
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut WatcherExcludes::default(),
+                &gitignore_changed
+            ),
             Some(RepoExternalChange::Worktree)
         );
 
@@ -3343,7 +3404,13 @@ mod tests {
             paths: vec![git_dir.join("refs").join("tags").join("v1.0.0")],
             attrs: Default::default(),
         };
-        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &mut WatcherExcludes::default(), &tag_event);
+        let change = classify_change(
+            &workdir,
+            Some(&git_dir),
+            &mut rules,
+            &mut WatcherExcludes::default(),
+            &tag_event,
+        );
         assert_eq!(
             change,
             Some(RepoExternalChange {
@@ -3360,7 +3427,13 @@ mod tests {
             paths: vec![git_dir.join("packed-refs")],
             attrs: Default::default(),
         };
-        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &mut WatcherExcludes::default(), &packed_event);
+        let change = classify_change(
+            &workdir,
+            Some(&git_dir),
+            &mut rules,
+            &mut WatcherExcludes::default(),
+            &packed_event,
+        );
         assert_eq!(
             change,
             Some(RepoExternalChange {
@@ -3377,7 +3450,13 @@ mod tests {
             paths: vec![git_dir.join("refs").join("heads").join("main")],
             attrs: Default::default(),
         };
-        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &mut WatcherExcludes::default(), &branch_event);
+        let change = classify_change(
+            &workdir,
+            Some(&git_dir),
+            &mut rules,
+            &mut WatcherExcludes::default(),
+            &branch_event,
+        );
         assert_eq!(
             change,
             Some(RepoExternalChange {
