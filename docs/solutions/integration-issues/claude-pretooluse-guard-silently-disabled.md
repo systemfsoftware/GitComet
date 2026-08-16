@@ -68,9 +68,11 @@ author's assumption.
 - Read the documented fields with a tolerant fallback for harness variance:
   `input?.tool_name ?? input?.tool` and `input?.tool_input?.command ?? input?.command`.
 - Guard `JSON.parse` so empty or malformed stdin exits 0 instead of crashing the hook.
-- Replace substring-regex matching with a tokenized argv scan: `git|git-wt`, optional
-  `-C <dir>` / `--git-dir=...` flags, then `worktree add`. A substring regex both
-  false-positives (`echo "git worktree add"`) and false-negatives (`git -C /x worktree add`).
+- Delegate command parsing to just-bash's AST and match the parsed argv:
+  `git|git-wt`, optional `-C <dir>` / `--git-dir` flags, then `worktree add`.
+  A substring regex false-positives (`echo "git worktree add"`) and misses
+  `git -C /x worktree add`; hand-splitting on whitespace misses env prefixes,
+  quoted subcommands, and compound commands.
 
 Verified with a fixture that mirrors the *real* PreToolUse payload, not the guessed one:
 
@@ -83,18 +85,24 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git worktree add ../foo"}}' \
 
 - For any hook, copy the input shape from the current hooks reference
   (code.claude.com/docs/en/hooks), not from memory or from an echo of your own fixture.
-- Smoke-test with at least the four-case matrix: target command, `git -C` variant,
-  literal-string containment (must pass), and empty/malformed stdin (must exit 0).
+- Smoke-test with the full matrix (`scripts/worktrunk` skill ships one: 24 cases —
+  env-prefix, compound, subshell, if-body, quoted-subcommand, containment,
+  dynamic-word, malformed, empty stdin, wt-absent fail-open).
 - Treat a 5-second timeout as a lower-bound worry, not the contract: the harness kills
   a slow hook, and a killed hook is a silent pass. Keep hook bodies fast and fail loudly.
 
 ## Runtime choice
 
-The guard's first version was a bun script. Wrong substrate: this machine's
-script convention is deno with exact scopes or plain bash (machine CLAUDE.md
-OP15/OP17), and a committed repo hook should not add a runtime collaborators
-may lack. Porting to deno exposed two more silent-exit traps, both observed
-this session on deno 2.9.5:
+The guard's first version was a bun script; the second hand-split the command on
+whitespace. Both wrong: the machine convention is deno with exact scopes, and a
+shell command is not a whitespace-split string. Hand-splitting misses env prefixes
+(`GIT_DIR=x git ...`), quoted subcommands (`git "worktree" add`), compounds,
+subshells, and if/for bodies, and false-positives on the same string inside echo.
+Parsing is now delegated to just-bash (github.com/vercel-labs/just-bash) — its
+`parse()` yields every SimpleCommand with env assignments already separated from
+the program name. Never write your own shell parser for a guard.
+
+Porting to deno exposed two silent-exit traps, both observed on deno 2.9.5:
 
 1. `Deno.stdin.text()` does not exist — the TypeError landed in the JSON.parse
    catch and exited 0 on every input. Read stdin with a chunked
@@ -103,7 +111,8 @@ this session on deno 2.9.5:
    `--allow-env=PATH`; without them the probe throws inside its own catch and
    the guard fails open invisibly.
 
-Gate for both: the Prevention matrix above (block, `git -C`, containment,
-empty stdin, plus a PATH-stripped run asserting fail-open) — every early exit
-is exercised, not just the intended ones. A catch that swallows a missing-API
-or permission error is indistinguishable from a decision to pass.
+Gate for all of it: the 24-case matrix plus a PATH-stripped run asserting
+fail-open — every early exit is exercised, not just the intended ones. A catch
+that swallows a missing-API or permission error is indistinguishable from a
+decision to pass.
+
