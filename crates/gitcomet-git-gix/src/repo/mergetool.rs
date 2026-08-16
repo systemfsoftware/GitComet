@@ -541,16 +541,11 @@ impl Drop for StagePaths {
             return;
         }
         for path in [&self.base, &self.local, &self.remote] {
-            match stage_path_to_fs_path(&self.workdir, path) {
-                Ok(path) => match std::fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => {}
-                },
-                // Stage paths are built from a conflict path already sanitized
-                // by sanitize_conflict_path_for_worktree; an Err here is
-                // unreachable, and skipping cleanup is the safe outcome.
-                Err(_) => {}
+            // Stage paths are built from a conflict path already sanitized by
+            // sanitize_conflict_path_for_worktree; an Err here is unreachable,
+            // and skipping cleanup is the safe outcome.
+            if let Ok(path) = stage_path_to_fs_path(&self.workdir, path) {
+                let _ = std::fs::remove_file(path); // best-effort cleanup
             }
         }
     }
@@ -730,6 +725,10 @@ fn sanitize_conflict_path_for_worktree(conflict_path: &Path) -> Result<PathBuf> 
             std::path::Component::Prefix(_)
                 | std::path::Component::RootDir
                 | std::path::Component::ParentDir
+        ) || matches!(
+            component,
+            std::path::Component::Normal(segment)
+                if segment.eq_ignore_ascii_case(".git")
         )
     }) {
         return Err(Error::new(ErrorKind::Backend(format!(

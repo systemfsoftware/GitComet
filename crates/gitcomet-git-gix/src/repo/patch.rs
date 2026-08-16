@@ -8,6 +8,18 @@ use std::path::Path;
 use tempfile::NamedTempFile;
 
 impl GixRepo {
+    /// Keep a pending patch unreadable to other local users while it sits in
+    /// the shared temp dir ahead of `git apply`. Named temp files are created
+    /// 0600; assert the mode explicitly per the audit so no future
+    /// tempfile/umask change can widen it.
+    #[cfg(unix)]
+    fn assert_temp_patch_private(tmp_file: &NamedTempFile) -> Result<()> {
+        tmp_file
+            .as_file()
+            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .map_err(|e| Error::new(ErrorKind::Io(e.kind())))
+    }
+
     pub(super) fn export_patch_with_output_impl(
         &self,
         commit_id: &CommitId,
@@ -45,15 +57,8 @@ impl GixRepo {
         tmp_file
             .write_all(patch.as_bytes())
             .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
-        // Keep the pending patch text unreadable to other local users while it
-        // sits in the shared temp dir ahead of `git apply`. Named temp files
-        // are created 0600; assert the mode explicitly per the audit so no
-        // future tempfile/umask change can widen it.
         #[cfg(unix)]
-        tmp_file
-            .as_file()
-            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
+        Self::assert_temp_patch_private(&tmp_file)?;
         let tmp_path = tmp_file.path();
 
         let mut cmd = self.git_workdir_cmd();
@@ -84,15 +89,8 @@ impl GixRepo {
         tmp_file
             .write_all(patch.as_bytes())
             .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
-        // Keep the pending patch text unreadable to other local users while it
-        // sits in the shared temp dir ahead of `git apply`. Named temp files
-        // are created 0600; assert the mode explicitly per the audit so no
-        // future tempfile/umask change can widen it.
         #[cfg(unix)]
-        tmp_file
-            .as_file()
-            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
+        Self::assert_temp_patch_private(&tmp_file)?;
         let tmp_path = tmp_file.path();
 
         let mut cmd = self.git_workdir_cmd();

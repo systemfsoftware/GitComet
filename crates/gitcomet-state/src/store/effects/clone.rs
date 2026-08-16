@@ -571,6 +571,7 @@ pub(super) fn schedule_clone_repo(
             .arg("color.ui=false")
             .arg("clone")
             .arg("--progress")
+            .arg("--")
             .arg(&url)
             .arg(&dest)
             .stdout(Stdio::piped())

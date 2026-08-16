@@ -1,6 +1,6 @@
+use gitcomet_core::fs_utils::{create_new_file, enforce_directory_is_private, open_append};
 use std::backtrace::Backtrace;
 use std::fmt::Write as _;
-use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -226,7 +226,8 @@ fn write_runtime_error_log(record: &log::Record<'_>) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let _ = enforce_directory_is_private(&dir);
+    // write_runtime_error_log_in_dir enforces directory privacy; the chmod is
+    // stat-guarded in fs_utils so an already-private dir costs nothing here.
 
     let location = record
         .file()
@@ -800,74 +801,6 @@ fn crash_dir_base_other(home: Option<&str>) -> Option<PathBuf> {
 fn crash_log_path(dir: &Path) -> Option<PathBuf> {
     let pid = std::process::id();
     Some(dir.join(format!("panic-{pid}-{}.log", unix_time_ms())))
-}
-
-/// Opens `path` for append while refusing to write through a hostile symlink:
-/// a symlink at `path` is removed first, so the append creates a fresh file.
-/// Regular files and directories are left untouched.
-fn open_append(path: &Path) -> std::io::Result<File> {
-    remove_symlink_entry(path)?;
-    OpenOptions::new().create(true).append(true).open(path)
-}
-
-/// Removes `path` only when `symlink_metadata` reports it as a symlink, never
-/// following the link itself. Anything else (regular file, directory) is left
-/// alone.
-fn remove_symlink_entry(path: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        },
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-/// Opens `path` for writing with O_EXCL semantics so a hostile symlink at
-/// `path` can never be followed. A stale entry left by an earlier process is
-/// replaced (only when it is a regular file or a symlink) and creation is
-/// retried once; a directory at `path` is never deleted.
-fn create_new_file(path: &Path) -> std::io::Result<File> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => Ok(file),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            match std::fs::symlink_metadata(path) {
-                Ok(metadata)
-                    if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
-                {
-                    std::fs::remove_file(path)?;
-                }
-                Ok(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!("refusing to replace non-file entry at {}", path.display()),
-                    ));
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-            OpenOptions::new().write(true).create_new(true).open(path)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// Restricts the crash directory to the owning user on unix: crash reports and
-/// session markers can embed backtraces, environment values and repository
-/// paths that other local accounts must not be able to read.
-fn enforce_directory_is_private(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
 }
 
 fn pending_report_path(dir: &Path) -> PathBuf {

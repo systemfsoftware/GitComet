@@ -896,10 +896,15 @@ impl Diff {
 
     pub fn from_unified_reader<R: std::io::BufRead>(
         target: DiffTarget,
-        mut reader: R,
+        reader: R,
     ) -> std::io::Result<Self> {
+        // Bound the read at the cap + 1 so a hostile diff can never force
+        // unbounded buffering; the length check below then rejects it.
+        use std::io::Read as _;
         let mut text = String::new();
-        reader.read_to_string(&mut text)?;
+        reader
+            .take(MAX_UNIFIED_DIFF_BYTES as u64 + 1)
+            .read_to_string(&mut text)?;
         if text.len() >= MAX_UNIFIED_DIFF_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

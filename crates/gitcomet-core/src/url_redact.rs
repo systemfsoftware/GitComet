@@ -48,6 +48,14 @@ pub fn validate_remote_url(url: &str) -> Result<(), Error> {
             "remote URL cannot be empty".to_string(),
         )));
     }
+    // A leading dash would be parsed by git as an option flag when the URL is
+    // passed without a `--` separator (e.g. clone, submodule add). Reject it
+    // so a hostile value can never smuggle options into a git invocation.
+    if url.starts_with('-') {
+        return Err(Error::new(ErrorKind::Backend(format!(
+            "remote URL must not start with '-': {url}"
+        ))));
+    }
 
     let Some(scheme_end) = explicit_url_scheme_end(url) else {
         return Ok(());
