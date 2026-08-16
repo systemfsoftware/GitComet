@@ -1,0 +1,13 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "command": "bun \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/git-worktree-guard.ts",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}

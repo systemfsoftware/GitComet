@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Worktrunk post-start: generate all build artifacts (background).
+# Invoked by .config/wt.toml. Arg: worktree_path
+#
+# A fresh worktree has none of the gitignored generated files that checks
+# depend on. The build produces them so tests and checks are green out of the
+# box. This must run AFTER install-deps.sh.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/worktrunk/lib.sh
+. "$SCRIPT_DIR/lib.sh"   # loud_fail / find_tool — this script runs in background
+
+WORKTREE_PATH="${1:?worktree_path required}"
+
+echo "generate-artifacts: generating build artifacts..."
+cd "$WORKTREE_PATH"
+
+if [[ -f "pnpm-lock.yaml" ]]; then
+    command -v corepack >/dev/null 2>&1 || loud_fail corepack
+    corepack pnpm build
+elif [[ -f "package-lock.json" ]]; then
+    command -v npm >/dev/null 2>&1 || loud_fail npm
+    npm run build
+elif [[ -f "yarn.lock" ]]; then
+    command -v yarn >/dev/null 2>&1 || loud_fail yarn
+    yarn build
+elif [[ -f "bun.lock" ]]; then
+    command -v bun >/dev/null 2>&1 || loud_fail bun
+    bun run build
+elif [[ -f "Cargo.toml" ]]; then
+    CARGO_BIN="$(find_tool cargo)" || loud_fail cargo
+    "$CARGO_BIN" build --release || "$CARGO_BIN" build
+elif [[ -f "Makefile" ]]; then
+    command -v make >/dev/null 2>&1 || loud_fail make
+    make build || make all
+else
+    echo "generate-artifacts: no recognized build system, skipping"
+fi
+
+echo "generate-artifacts: done"

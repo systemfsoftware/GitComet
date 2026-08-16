@@ -1,0 +1,4 @@
+# Worktree include whitelist — only gitignored files matching these patterns
+# are copied by wt step copy-ignored. Cargo workspace (probe: PKG_MANAGER=cargo).
+target
+target/**

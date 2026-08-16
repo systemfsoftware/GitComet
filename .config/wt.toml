@@ -1,0 +1,31 @@
+# Worktree lifecycle hooks — GitComet (Rust workspace, gpui).
+# Modern split: pre-start (blocking, fast) + post-start (background).
+# Emission rules applied from probe facts 2026-08-16:
+#   HAS_CODEGRAPH=0 -> no codegraph line; no dev server -> no tether;
+#   PKG_MANAGER=cargo -> copy/deps/generate emitted (G10 warning: cargo not on
+#   PATH anywhere probed; install-deps/generate resolve at run time and fail loud).
+
+# --- Blocking: filesystem setup (must complete before the worktree is usable) ---
+[[pre-start]]
+setup = "{{ worktree_path }}/scripts/worktrunk/pre-start.sh '{{ worktree_path }}' '{{ primary_worktree_path }}'"
+
+# --- Background: build cache, deps, artifacts (agent can edit while these run) ---
+# Block order is load-bearing: copy-ignored reflinks the target/ cache before
+# cargo reconciles it; deps before generate — generate-artifacts.sh runs the
+# build tool, so a concurrent table dies with "command not found".
+[[post-start]]
+copy = "wt step copy-ignored"
+
+[[post-start]]
+deps = "{{ worktree_path }}/scripts/worktrunk/install-deps.sh '{{ worktree_path }}'"
+
+[[post-start]]
+generate = "{{ worktree_path }}/scripts/worktrunk/generate-artifacts.sh '{{ worktree_path }}'"
+
+# --- Post-switch: runs every time you switch into this worktree ---
+[post-switch]
+gitkraken-compat = "{{ worktree_path }}/scripts/worktrunk/post-switch.sh '{{ worktree_path }}'"
+
+# --- Pre-merge: cleanup before merge ---
+[pre-merge]
+cleanup = "{{ worktree_path }}/scripts/worktrunk/pre-merge.sh '{{ worktree_path }}'"
