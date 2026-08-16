@@ -80,6 +80,7 @@ gpui = { workspace = true }
 gpui_platform = { workspace = true }
 image = { workspace = true }
 jiff = { workspace = true }
+log = { workspace = true }
 lru = { workspace = true }
 memchr = { workspace = true }
 mimalloc = { workspace = true }

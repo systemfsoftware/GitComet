@@ -146,7 +146,7 @@ fn write_copy_diagnostic_inner(
     let mut file =
         create_new_file(&dir.join(format!("last-operation-{}.log", std::process::id())))?;
     use std::io::Write as _;
-    file.write_all(text.as_bytes())?;…
+    file.write_all(text.as_bytes())?;
     file.sync_data()
 }
 
