@@ -49,3 +49,22 @@ gitkraken_present() {
     command -v gitkraken-cli >/dev/null 2>&1 && return 0
     [[ -d "$HOME/.config/GitKraken" || -d "$HOME/.gitkraken" ]]
 }
+
+# Detect the package manager from lockfiles present in the current directory.
+# Echoes the manager command ("corepack", "npm", "yarn", "bun", "cargo");
+# returns 1 and echoes nothing when no recognized lockfile exists.
+detect_manager() {
+    if [[ -f "pnpm-lock.yaml" ]]; then
+        printf '%s' corepack
+    elif [[ -f "package-lock.json" ]]; then
+        printf '%s' npm
+    elif [[ -f "yarn.lock" ]]; then
+        printf '%s' yarn
+    elif [[ -f "bun.lock" ]]; then
+        printf '%s' bun
+    elif [[ -f "Cargo.toml" ]]; then
+        printf '%s' cargo
+    else
+        return 1
+    fi
+}

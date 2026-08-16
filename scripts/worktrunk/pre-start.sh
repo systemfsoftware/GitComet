@@ -9,7 +9,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/worktrunk/lib.sh
 . "$SCRIPT_DIR/lib.sh"
 
-# Convert main repo's .git/worktrees/<name>/gitdir to relative path
 convert_main_repo_gitdir_to_relative() {
     local worktree_path="${1%/}"
     local primary_path="$2"
@@ -31,7 +30,6 @@ convert_main_repo_gitdir_to_relative() {
     done
 }
 
-# Convert worktree's .git file to relative path (prevents GitKraken issues)
 convert_worktree_gitfile_to_relative() {
     local worktree_path="${1%/}"
     local git_file="$worktree_path/.git"

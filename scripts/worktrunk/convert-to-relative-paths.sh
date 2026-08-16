@@ -49,7 +49,6 @@ echo ""
 
 converted=0
 failed=0
-skipped=0
 
 for worktree_dir in "$WORKTREES_ROOT"/*/; do
     [[ -d "$worktree_dir" ]] || continue

@@ -16,32 +16,45 @@ echo "install-deps: installing dependencies in worktree..."
 cd "$WORKTREE_PATH"
 
 # Detect package manager, resolve its tool, run install.
-if [[ -f "pnpm-lock.yaml" ]]; then
-    command -v corepack >/dev/null 2>&1 || loud_fail corepack
-    corepack pnpm install --frozen-lockfile
-elif [[ -f "package-lock.json" ]]; then
-    command -v npm >/dev/null 2>&1 || loud_fail npm
-    npm ci
-elif [[ -f "yarn.lock" ]]; then
-    command -v yarn >/dev/null 2>&1 || loud_fail yarn
-    yarn install --frozen-lockfile
-elif [[ -f "bun.lock" ]]; then
-    command -v bun >/dev/null 2>&1 || loud_fail bun
-    bun install --frozen-lockfile
-elif [[ -f "Cargo.toml" ]]; then
-    CARGO_BIN="$(find_tool cargo)" || loud_fail cargo
-    "$CARGO_BIN" build
-elif [[ -f "go.mod" ]]; then
-    GO_BIN="$(find_tool go)" || loud_fail go
-    "$GO_BIN" mod download
-elif [[ -f "Gemfile" ]]; then
-    command -v bundle >/dev/null 2>&1 || loud_fail bundle
-    bundle install
-elif [[ -f "pyproject.toml" || -f "requirements.txt" ]]; then
-    command -v pip >/dev/null 2>&1 || loud_fail pip
-    pip install -e . 2>/dev/null || pip install -r requirements.txt
-else
-    echo "install-deps: no recognized package manager, skipping"
-fi
+MANAGER="$(detect_manager || true)"
+case "$MANAGER" in
+    corepack)
+        command -v corepack >/dev/null 2>&1 || loud_fail corepack
+        corepack pnpm install --frozen-lockfile
+        ;;
+    npm)
+        command -v npm >/dev/null 2>&1 || loud_fail npm
+        npm ci
+        ;;
+    yarn)
+        command -v yarn >/dev/null 2>&1 || loud_fail yarn
+        yarn install --frozen-lockfile
+        ;;
+    bun)
+        command -v bun >/dev/null 2>&1 || loud_fail bun
+        bun install --frozen-lockfile
+        ;;
+    cargo)
+        CARGO_BIN="$(find_tool cargo)" || loud_fail cargo
+        "$CARGO_BIN" build
+        ;;
+    "")
+        if [[ -f "go.mod" ]]; then
+            GO_BIN="$(find_tool go)" || loud_fail go
+            "$GO_BIN" mod download
+        elif [[ -f "Gemfile" ]]; then
+            command -v bundle >/dev/null 2>&1 || loud_fail bundle
+            bundle install
+        elif [[ -f "pyproject.toml" || -f "requirements.txt" ]]; then
+            command -v pip >/dev/null 2>&1 || loud_fail pip
+            pip install -e . 2>/dev/null || pip install -r requirements.txt
+        else
+            echo "install-deps: no recognized package manager, skipping"
+        fi
+        ;;
+    *)
+        echo "install-deps: no recognized package manager, skipping"
+        ;;
+esac
 
 echo "install-deps: done"

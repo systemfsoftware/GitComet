@@ -39,7 +39,7 @@ for wt_path in $(git worktree list --porcelain | awk '/^worktree / {print $2}');
 
   gitdir_line=$(head -1 "$wt_path/.git")
   [[ "$gitdir_line" == gitdir:* ]] || continue
-  abs_path=$(printf '%s' "${gitdir_line#gitdir: }" | tr -d '\n\r')
+  abs_path="${gitdir_line#gitdir: }"
   [[ "$abs_path" == /* ]] || continue
 
   rel_path=$(realpath --relative-to="$wt_path" "$abs_path" 2>/dev/null) || continue
