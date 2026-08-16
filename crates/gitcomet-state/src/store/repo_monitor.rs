@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::repo_load_trace;
 use super::send_diagnostics::{SendFailureKind, send_or_log};
+use super::watcher_excludes::WatcherExcludes;
 use super::worker_channel::StoreWorkerSender;
 
 enum MonitorMsg {
@@ -285,12 +286,16 @@ impl DebouncedChange {
 
 pub(super) struct RepoMonitorManager {
     handles: HashMap<RepoId, RepoMonitorHandle>,
+    /// The IDE-excludes setting value last applied to the running monitors;
+    /// `None` until the first sync establishes it.
+    excludes_enabled: Option<bool>,
 }
 
 impl RepoMonitorManager {
     pub(super) fn new() -> Self {
         Self {
             handles: HashMap::default(),
+            excludes_enabled: None,
         }
     }
 
@@ -323,6 +328,7 @@ impl RepoMonitorManager {
         workdir: PathBuf,
         msg_tx: StoreWorkerSender,
         active_repo_id: Arc<AtomicU64>,
+        respect_ide_watch_excludes: bool,
     ) {
         let std::collections::hash_map::Entry::Vacant(entry) = self.handles.entry(repo_id) else {
             return;
@@ -340,6 +346,7 @@ impl RepoMonitorManager {
                 monitor_tx_for_notify,
                 active_repo_id,
                 monitor_enabled_for_thread,
+                respect_ide_watch_excludes,
             )
         });
         entry.insert(RepoMonitorHandle {
@@ -347,6 +354,48 @@ impl RepoMonitorManager {
             join,
             monitor_enabled,
         });
+    }
+
+    /// Keeps the running monitor set aligned with the active repository and the
+    /// IDE-excludes setting.
+    ///
+    /// Stops monitors of non-active repos. When the setting changed since the
+    /// last sync, force-restarts a running active monitor so the new setting
+    /// applies live (plan R7 / KTD5). Starts the active repo's monitor when it
+    /// is not running.
+    pub(super) fn sync_active_repo(
+        &mut self,
+        active_repo: Option<RepoId>,
+        active_workdir: Option<PathBuf>,
+        respect_ide_watch_excludes: bool,
+        msg_tx: StoreWorkerSender,
+        active_repo_id: Arc<AtomicU64>,
+    ) {
+        for repo_id in self.running_repo_ids() {
+            if Some(repo_id) != active_repo {
+                self.stop(repo_id);
+            }
+        }
+        let Some(repo_id) = active_repo else {
+            self.excludes_enabled = None;
+            return;
+        };
+        let Some(workdir) = active_workdir else {
+            self.excludes_enabled = None;
+            return;
+        };
+        let config_changed = self.excludes_enabled != Some(respect_ide_watch_excludes);
+        if config_changed && self.is_running(repo_id) {
+            self.stop(repo_id);
+        }
+        self.start(
+            repo_id,
+            workdir,
+            msg_tx,
+            active_repo_id,
+            respect_ide_watch_excludes,
+        );
+        self.excludes_enabled = Some(respect_ide_watch_excludes);
     }
 
     #[cfg(test)]
@@ -657,6 +706,7 @@ fn build_workdir_watcher(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
     watched_dirs: &mut HashSet<PathBuf>,
     monitor_tx: &mpsc::Sender<MonitorMsg>,
     monitor_enabled: &Arc<AtomicBool>,
@@ -694,6 +744,7 @@ fn build_workdir_watcher(
         workdir,
         git_dir,
         gitignore,
+        watcher_excludes,
         repo_id,
     );
     if outcome == WatchSetupOutcome::RootWatchFailed {
@@ -779,6 +830,7 @@ fn attempt_degraded_watch_recovery(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
     watched_dirs: &mut HashSet<PathBuf>,
     monitor_tx: &mpsc::Sender<MonitorMsg>,
     monitor_enabled: &Arc<AtomicBool>,
@@ -793,11 +845,13 @@ fn attempt_degraded_watch_recovery(
     // tree, so the current rules are potentially stale. The capped walk then bounds the cost of
     // re-checking while still over budget.
     *gitignore = GitignoreRules::load(workdir);
+    *watcher_excludes = WatcherExcludes::load(workdir, watcher_excludes.enabled());
     let subdir_count = collect_watchable_dirs_capped(
         workdir,
         workdir,
         git_dir,
         gitignore,
+        watcher_excludes,
         MAX_WORKTREE_WATCH_DIRS,
     )
     .len()
@@ -810,6 +864,7 @@ fn attempt_degraded_watch_recovery(
         workdir,
         git_dir,
         gitignore,
+        watcher_excludes,
         watched_dirs,
         monitor_tx,
         monitor_enabled,
@@ -823,6 +878,7 @@ fn attempt_degraded_watch_recovery(
     _workdir: &Path,
     _git_dir: Option<&Path>,
     _gitignore: &mut GitignoreRules,
+    _watcher_excludes: &mut WatcherExcludes,
     _watched_dirs: &mut HashSet<PathBuf>,
     _monitor_tx: &mpsc::Sender<MonitorMsg>,
     _monitor_enabled: &Arc<AtomicBool>,
@@ -838,6 +894,7 @@ fn repo_monitor_thread(
     monitor_tx: mpsc::Sender<MonitorMsg>,
     active_repo_id: Arc<AtomicU64>,
     monitor_enabled: Arc<AtomicBool>,
+    respect_ide_watch_excludes: bool,
 ) {
     let workdir = super::canonicalize_path(workdir);
     if !monitor_enabled.load(Ordering::Relaxed) {
@@ -846,6 +903,7 @@ fn repo_monitor_thread(
     }
     let git_dir = resolve_git_dir(&workdir);
     let mut gitignore = GitignoreRules::load(&workdir);
+    let mut watcher_excludes = WatcherExcludes::load(&workdir, respect_ide_watch_excludes);
 
     // The set of worktree subdirectories currently watched per-directory, kept in sync as the tree
     // changes (deduped on re-watch, pruned on deletion). `build_workdir_watcher` repopulates it; its
@@ -857,6 +915,7 @@ fn repo_monitor_thread(
         &workdir,
         git_dir.as_deref(),
         &mut gitignore,
+        &mut watcher_excludes,
         &mut watched_dirs,
         &monitor_tx,
         &monitor_enabled,
@@ -952,6 +1011,7 @@ fn repo_monitor_thread(
                                 &workdir,
                                 git_dir.as_deref(),
                                 &mut gitignore,
+                                &mut watcher_excludes,
                                 &event,
                             );
                         }
@@ -962,6 +1022,7 @@ fn repo_monitor_thread(
                             &workdir,
                             git_dir.as_deref(),
                             &mut gitignore,
+                            &mut watcher_excludes,
                             &event,
                         );
                         repo_load_trace::trace!(
@@ -978,19 +1039,23 @@ fn repo_monitor_thread(
                                 flush(to_flush);
                             }
                         }
-                        if classified.gitignore_changed {
-                            // The ignore rules changed (and `classify_repo_event` already reloaded
-                            // them), so re-initiate the worktree watches from scratch by rebuilding
-                            // the watcher. Dropping the old watcher releases all of its inotify
-                            // watches, so directories that just became ignored stop being watched
-                            // (no more churn) and ones that became un-ignored gain watches — keeping
-                            // the watched set minimal. The rebuilt watcher is only swapped in if it
-                            // sets up successfully, so a transient failure never leaves us watcherless.
+                        if classified.rules_changed {
+                            // The watcher ignore rules changed (and
+                            // `classify_repo_event` already reloaded them), so
+                            // re-initiate the worktree watches from scratch by
+                            // rebuilding the watcher. Dropping the old watcher
+                            // releases all of its inotify watches, so directories
+                            // that just became ignored stop being watched (no more
+                            // churn) and ones that became un-ignored gain watches —
+                            // keeping the watched set minimal. The rebuilt watcher
+                            // is only swapped in if it sets up successfully, so a
+                            // transient failure never leaves us watcherless.
                             if let Some((new_watcher, new_outcome)) = build_workdir_watcher(
                                 repo_id,
                                 &workdir,
                                 git_dir.as_deref(),
                                 &mut gitignore,
+                                &mut watcher_excludes,
                                 &mut watched_dirs,
                                 &monitor_tx,
                                 &monitor_enabled,
@@ -1038,6 +1103,7 @@ fn repo_monitor_thread(
                         &workdir,
                         git_dir.as_deref(),
                         &mut gitignore,
+                        &mut watcher_excludes,
                         &mut watched_dirs,
                         &monitor_tx,
                         &monitor_enabled,
@@ -1058,8 +1124,28 @@ fn repo_monitor_thread(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn is_ignored_dir(workdir: &Path, gitignore: &mut GitignoreRules, path: &Path) -> bool {
+fn is_ignored_dir(
+    workdir: &Path,
+    gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
+    path: &Path,
+) -> bool {
     is_ignored_worktree_path_with_hint(workdir, gitignore, path, Some(true))
+        || is_excluded_worktree_path_with_hint(workdir, watcher_excludes, path, Some(true))
+}
+
+/// Whether `path` falls under an IDE watcher-exclude rule; `None` on paths
+/// outside the worktree (never excluded).
+fn is_excluded_worktree_path_with_hint(
+    workdir: &Path,
+    watcher_excludes: &mut WatcherExcludes,
+    path: &Path,
+    is_dir_hint: Option<bool>,
+) -> bool {
+    let Ok(rel) = path.strip_prefix(workdir) else {
+        return false;
+    };
+    watcher_excludes.is_excluded(rel, is_dir_hint)
 }
 
 /// Collects every directory in `start`'s subtree that the monitor should watch: it skips the git
@@ -1074,8 +1160,16 @@ fn collect_watchable_dirs(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
 ) -> Vec<PathBuf> {
-    collect_watchable_dirs_capped(start, workdir, git_dir, gitignore, usize::MAX)
+    collect_watchable_dirs_capped(
+        start,
+        workdir,
+        git_dir,
+        gitignore,
+        watcher_excludes,
+        usize::MAX,
+    )
 }
 
 /// Like [`collect_watchable_dirs`] but stops early once more than `max_subdirs` non-root directories
@@ -1088,13 +1182,14 @@ fn collect_watchable_dirs_capped(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
     max_subdirs: usize,
 ) -> Vec<PathBuf> {
     let mut result = Vec::new();
     if is_git_related_path(workdir, git_dir, start) {
         return result;
     }
-    if start != workdir && is_ignored_dir(workdir, gitignore, start) {
+    if start != workdir && is_ignored_dir(workdir, gitignore, watcher_excludes, start) {
         return result;
     }
 
@@ -1120,7 +1215,7 @@ fn collect_watchable_dirs_capped(
             }
             let path = entry.path();
             if is_git_related_path(workdir, git_dir, &path)
-                || is_ignored_dir(workdir, gitignore, &path)
+                || is_ignored_dir(workdir, gitignore, watcher_excludes, &path)
             {
                 continue;
             }
@@ -1144,6 +1239,7 @@ fn add_subtree_watches(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
 ) {
     let remaining = max_dirs.saturating_sub(watched_dirs.len());
     if remaining == 0 {
@@ -1154,7 +1250,14 @@ fn add_subtree_watches(
         );
         return;
     }
-    for dir in collect_watchable_dirs_capped(start, workdir, git_dir, gitignore, remaining) {
+    for dir in collect_watchable_dirs_capped(
+        start,
+        workdir,
+        git_dir,
+        gitignore,
+        watcher_excludes,
+        remaining,
+    ) {
         if watched_dirs.len() >= max_dirs {
             repo_load_trace::trace!(
                 "monitor_runtime_watch_budget_reached watched={} max={}",
@@ -1219,6 +1322,7 @@ fn setup_workdir_watch(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
     repo_id: RepoId,
 ) -> WatchSetupOutcome {
     setup_workdir_watch_with_limit(
@@ -1227,6 +1331,7 @@ fn setup_workdir_watch(
         workdir,
         git_dir,
         gitignore,
+        watcher_excludes,
         repo_id,
         MAX_WORKTREE_WATCH_DIRS,
     )
@@ -1242,13 +1347,15 @@ fn setup_workdir_watch_with_limit(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
     repo_id: RepoId,
     max_dirs: usize,
 ) -> WatchSetupOutcome {
     watched_dirs.clear();
     // Always watch the workdir root non-recursively: it is cheap, catches edits to root-level files,
-    // and — crucially — observes root `.gitignore` edits so the watcher can re-initiate (and so a
-    // worktree that drops below the budget after an ignore edit can start watching its source tree).
+    // and — crucially — observes root `.gitignore` and `.vscode/settings.json` edits so the watcher
+    // can re-initiate (and so a worktree that drops below the budget after an ignore edit can start
+    // watching its source tree).
     if let Err(error) = watcher.watch(workdir, RecursiveMode::NonRecursive) {
         record_monitor_failure(
             MonitorFailureKind::Start,
@@ -1263,7 +1370,14 @@ fn setup_workdir_watch_with_limit(
 
     // Capped walk: a worktree far over budget stops the walk early instead of enumerating every
     // directory just to learn it is over budget.
-    let dirs = collect_watchable_dirs_capped(workdir, workdir, git_dir, gitignore, max_dirs);
+    let dirs = collect_watchable_dirs_capped(
+        workdir,
+        workdir,
+        git_dir,
+        gitignore,
+        watcher_excludes,
+        max_dirs,
+    );
     let subdir_count = dirs.len().saturating_sub(1);
 
     if subdir_count > max_dirs {
@@ -1342,6 +1456,7 @@ fn setup_workdir_watch(
     workdir: &Path,
     _git_dir: Option<&Path>,
     _gitignore: &mut GitignoreRules,
+    _watcher_excludes: &mut WatcherExcludes,
     repo_id: RepoId,
 ) -> WatchSetupOutcome {
     if let Err(error) = watcher
@@ -1384,6 +1499,7 @@ fn watch_created_dirs(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
     event: &notify::Event,
 ) {
     if !event_brings_in_new_dir(event) {
@@ -1402,6 +1518,7 @@ fn watch_created_dirs(
                 workdir,
                 git_dir,
                 gitignore,
+                watcher_excludes,
             );
         }
     }
@@ -1415,6 +1532,7 @@ fn watch_created_dirs(
     _workdir: &Path,
     _git_dir: Option<&Path>,
     _gitignore: &mut GitignoreRules,
+    _watcher_excludes: &mut WatcherExcludes,
     _event: &notify::Event,
 ) {
 }
@@ -1526,19 +1644,20 @@ fn merge_change(a: RepoExternalChange, b: RepoExternalChange) -> RepoExternalCha
 }
 
 /// Result of classifying a watcher event: the (optional) coalesced change to refresh, and whether
-/// the ignore configuration changed (so the caller can re-initiate the worktree watches without
-/// re-scanning the paths or re-loading the rules — this function already reloaded them in place).
+/// the watcher ignore configuration changed (so the caller can re-initiate the worktree watches
+/// without re-scanning the paths or re-loading the rules — this function already reloaded them in
+/// place).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClassifiedEvent {
     change: Option<RepoExternalChange>,
-    gitignore_changed: bool,
+    rules_changed: bool,
 }
 
 impl ClassifiedEvent {
     fn none() -> Self {
         Self {
             change: None,
-            gitignore_changed: false,
+            rules_changed: false,
         }
     }
 }
@@ -1547,6 +1666,7 @@ fn classify_repo_event(
     workdir: &Path,
     git_dir: Option<&Path>,
     gitignore: &mut GitignoreRules,
+    watcher_excludes: &mut WatcherExcludes,
     event: &notify::Event,
 ) -> ClassifiedEvent {
     if should_ignore_event_kind(event) {
@@ -1554,34 +1674,42 @@ fn classify_repo_event(
     }
 
     // Detect (and reload on) ignore-config changes once, up front, so the result is reliable even on
-    // a rescan event and the caller never needs a second scan or a second `GitignoreRules::load`.
-    let gitignore_changed = event
+    // a rescan event and the caller never needs a second scan or a second rules reload.
+    let gitignore_config_changed = event
         .paths
         .iter()
         .any(|p| is_gitignore_config_path(workdir, git_dir, p));
-    if gitignore_changed {
+    let ide_excludes_config_changed = event
+        .paths
+        .iter()
+        .any(|p| is_ide_watcher_excludes_config_path(workdir, p));
+    let rules_changed = gitignore_config_changed || ide_excludes_config_changed;
+    if gitignore_config_changed {
         *gitignore = GitignoreRules::load(workdir);
+    }
+    if ide_excludes_config_changed {
+        *watcher_excludes = WatcherExcludes::load(workdir, watcher_excludes.enabled());
     }
 
     // If notify indicates a rescan is needed, assume anything could have changed.
     if event.need_rescan() {
         return ClassifiedEvent {
             change: Some(RepoExternalChange::all()),
-            gitignore_changed,
+            rules_changed,
         };
     }
 
-    if gitignore_changed {
+    if rules_changed {
         return ClassifiedEvent {
             change: Some(RepoExternalChange::worktree()),
-            gitignore_changed: true,
+            rules_changed: true,
         };
     }
 
     if event.paths.is_empty() {
         return ClassifiedEvent {
             change: Some(RepoExternalChange::all()),
-            gitignore_changed: false,
+            rules_changed: false,
         };
     }
 
@@ -1605,7 +1733,14 @@ fn classify_repo_event(
                 }
             }
         } else {
-            if is_ignored_worktree_path_with_hint(workdir, gitignore, path, is_dir_hint) {
+            if is_ignored_worktree_path_with_hint(workdir, gitignore, path, is_dir_hint)
+                || is_excluded_worktree_path_with_hint(
+                    workdir,
+                    watcher_excludes,
+                    path,
+                    is_dir_hint,
+                )
+            {
                 continue;
             }
             saw_worktree = true;
@@ -1620,7 +1755,7 @@ fn classify_repo_event(
     };
     ClassifiedEvent {
         change: (!change.is_empty()).then_some(change),
-        gitignore_changed: false,
+        rules_changed: false,
     }
 }
 
@@ -1712,6 +1847,12 @@ fn is_gitignore_config_path(workdir: &Path, git_dir: Option<&Path>, path: &Path)
         return true;
     }
     git_dir.is_some_and(|git_dir| path == git_dir.join("info").join("exclude"))
+}
+
+/// Whether `path` is the IDE watcher-excludes config file (`.vscode/settings.json` at the worktree
+/// root). Its own edits reload the exclude rules and rebuild the worktree watches (plan R4).
+fn is_ide_watcher_excludes_config_path(workdir: &Path, path: &Path) -> bool {
+    path == WatcherExcludes::config_path(workdir)
 }
 
 fn is_ignored_worktree_path_with_hint(
@@ -1867,14 +2008,15 @@ mod tests {
     }
 
     /// Test helper: classify an event and return just the coalesced change (dropping the
-    /// `gitignore_changed` signal), matching the pre-`ClassifiedEvent` return shape these tests use.
+    /// `rules_changed` signal), matching the pre-`ClassifiedEvent` return shape these tests use.
     fn classify_change(
         workdir: &Path,
         git_dir: Option<&Path>,
         gitignore: &mut GitignoreRules,
+        watcher_excludes: &mut WatcherExcludes,
         event: &notify::Event,
     ) -> Option<RepoExternalChange> {
-        classify_repo_event(workdir, git_dir, gitignore, event).change
+        classify_repo_event(workdir, git_dir, gitignore, watcher_excludes, event).change
     }
 
     #[test]
@@ -1949,6 +2091,7 @@ mod tests {
                 &workdir,
                 Some(&workdir.join(".git")),
                 &mut GitignoreRules::default(),
+                &mut WatcherExcludes::default(),
                 &event
             ),
             Some(RepoExternalChange::Index)
@@ -1964,6 +2107,7 @@ mod tests {
                 &workdir,
                 Some(&workdir.join(".git")),
                 &mut GitignoreRules::default(),
+                &mut WatcherExcludes::default(),
                 &event
             ),
             Some(RepoExternalChange::Worktree)
@@ -1979,6 +2123,7 @@ mod tests {
                 &workdir,
                 Some(&workdir.join(".git")),
                 &mut GitignoreRules::default(),
+                &mut WatcherExcludes::default(),
                 &event
             ),
             Some(RepoExternalChange {
@@ -2007,6 +2152,7 @@ mod tests {
                 &workdir,
                 Some(&workdir.join(".git")),
                 &mut rules,
+                &mut WatcherExcludes::default(),
                 &create_lock
             ),
             None,
@@ -2024,6 +2170,7 @@ mod tests {
                 &workdir,
                 Some(&workdir.join(".git")),
                 &mut rules,
+                &mut WatcherExcludes::default(),
                 &remove_lock
             ),
             None,
@@ -2047,7 +2194,7 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, Some(&workdir.join(".git")), &mut rules, &event),
+            classify_change(&workdir, Some(&workdir.join(".git")), &mut rules, &mut WatcherExcludes::default(), &event),
             Some(RepoExternalChange::Worktree),
             "ignoring index.lock should still classify real worktree changes"
         );
@@ -2109,6 +2256,7 @@ mod tests {
                 &workdir,
                 Some(&workdir.join(".git")),
                 &mut GitignoreRules::default(),
+                &mut WatcherExcludes::default(),
                 &event
             ),
             None
@@ -2124,6 +2272,7 @@ mod tests {
                 &workdir,
                 Some(&workdir.join(".git")),
                 &mut GitignoreRules::default(),
+                &mut WatcherExcludes::default(),
                 &event
             ),
             None
@@ -2139,6 +2288,7 @@ mod tests {
                 &workdir,
                 Some(&workdir.join(".git")),
                 &mut GitignoreRules::default(),
+                &mut WatcherExcludes::default(),
                 &event
             ),
             Some(RepoExternalChange::Worktree)
@@ -2193,7 +2343,7 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &event),
+            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &event),
             None
         );
     }
@@ -2228,7 +2378,7 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &tracked_event),
+            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &tracked_event),
             Some(RepoExternalChange::Worktree)
         );
 
@@ -2238,7 +2388,7 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &ignored_event),
+            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &ignored_event),
             None
         );
     }
@@ -2254,7 +2404,7 @@ mod tests {
         let git_dir = resolve_git_dir(&workdir);
         let mut gitignore = GitignoreRules::load(&workdir);
 
-        let dirs = collect_watchable_dirs(&workdir, &workdir, git_dir.as_deref(), &mut gitignore);
+        let dirs = collect_watchable_dirs(&workdir, &workdir, git_dir.as_deref(), &mut gitignore, &mut WatcherExcludes::default());
 
         assert!(dirs.contains(&workdir), "workdir root must be watched");
         assert!(
@@ -2309,6 +2459,7 @@ mod tests {
                     &workdir,
                     git_dir.as_deref(),
                     &mut gitignore,
+                    &mut WatcherExcludes::default(),
                     RepoId(1),
                 ),
                 WatchSetupOutcome::Watching { failed_dirs: 0 }
@@ -2470,6 +2621,7 @@ mod tests {
                     &workdir,
                     git_dir.as_deref(),
                     &mut gitignore,
+                    &mut WatcherExcludes::default(),
                     RepoId(1),
                 ),
                 WatchSetupOutcome::Watching { failed_dirs: 0 }
@@ -2546,15 +2698,7 @@ mod tests {
         let mut watched_dirs: HashSet<PathBuf> = HashSet::default();
 
         // vendor/ is not yet ignored, so the initial setup watches it.
-        let (_initial, _) = build_workdir_watcher(
-            RepoId(1),
-            &workdir,
-            git_dir.as_deref(),
-            &mut gitignore,
-            &mut watched_dirs,
-            &monitor_tx,
-            &monitor_enabled,
-        )
+        let (_initial, _) = build_workdir_watcher(RepoId(1), &workdir, git_dir.as_deref(), &mut gitignore, &mut WatcherExcludes::default(), &mut watched_dirs, &monitor_tx, &monitor_enabled)
         .expect("initial watcher build must succeed");
         assert!(
             watched_dirs.contains(&workdir.join("vendor")),
@@ -2566,15 +2710,7 @@ mod tests {
         // below) releases its watches.
         fs::write(workdir.join(".gitignore"), "vendor/\n").expect("write .gitignore");
         gitignore = GitignoreRules::load(&workdir);
-        let (_watcher, _) = build_workdir_watcher(
-            RepoId(1),
-            &workdir,
-            git_dir.as_deref(),
-            &mut gitignore,
-            &mut watched_dirs,
-            &monitor_tx,
-            &monitor_enabled,
-        )
+        let (_watcher, _) = build_workdir_watcher(RepoId(1), &workdir, git_dir.as_deref(), &mut gitignore, &mut WatcherExcludes::default(), &mut watched_dirs, &monitor_tx, &monitor_enabled)
         .expect("rebuilt watcher must succeed");
         drop(_initial);
         assert!(
@@ -2714,6 +2850,7 @@ mod tests {
             &workdir,
             git_dir.as_deref(),
             &mut gitignore,
+            &mut WatcherExcludes::default(),
         );
         let after_first = watched.len();
         assert!(after_first >= 2, "src + src/sub should be watched");
@@ -2727,6 +2864,7 @@ mod tests {
             &workdir,
             git_dir.as_deref(),
             &mut gitignore,
+            &mut WatcherExcludes::default(),
         );
         assert_eq!(
             watched.len(),
@@ -2803,6 +2941,7 @@ mod tests {
             &workdir,
             git_dir.as_deref(),
             &mut gitignore,
+            &mut WatcherExcludes::default(),
             RepoId(1),
             0,
         );
@@ -2979,7 +3118,7 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &empty_paths),
+            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &empty_paths),
             Some(RepoExternalChange::Both)
         );
 
@@ -2989,7 +3128,7 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &git_head),
+            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &git_head),
             Some(RepoExternalChange::GitState)
         );
 
@@ -2999,7 +3138,7 @@ mod tests {
             attrs: Default::default(),
         };
         assert_eq!(
-            classify_change(&workdir, git_dir.as_deref(), &mut rules, &gitignore_changed),
+            classify_change(&workdir, git_dir.as_deref(), &mut rules, &mut WatcherExcludes::default(), &gitignore_changed),
             Some(RepoExternalChange::Worktree)
         );
 
@@ -3013,6 +3152,7 @@ mod tests {
                 &workdir,
                 git_dir.as_deref(),
                 &mut rules,
+                &mut WatcherExcludes::default(),
                 &nested_gitignore_changed
             ),
             Some(RepoExternalChange::Worktree)
@@ -3203,7 +3343,7 @@ mod tests {
             paths: vec![git_dir.join("refs").join("tags").join("v1.0.0")],
             attrs: Default::default(),
         };
-        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &tag_event);
+        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &mut WatcherExcludes::default(), &tag_event);
         assert_eq!(
             change,
             Some(RepoExternalChange {
@@ -3220,7 +3360,7 @@ mod tests {
             paths: vec![git_dir.join("packed-refs")],
             attrs: Default::default(),
         };
-        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &packed_event);
+        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &mut WatcherExcludes::default(), &packed_event);
         assert_eq!(
             change,
             Some(RepoExternalChange {
@@ -3237,7 +3377,7 @@ mod tests {
             paths: vec![git_dir.join("refs").join("heads").join("main")],
             attrs: Default::default(),
         };
-        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &branch_event);
+        let change = classify_change(&workdir, Some(&git_dir), &mut rules, &mut WatcherExcludes::default(), &branch_event);
         assert_eq!(
             change,
             Some(RepoExternalChange {
@@ -3246,6 +3386,301 @@ mod tests {
                 ..Default::default()
             }),
             "branch ref file should produce tags: false"
+        );
+    }
+
+    #[test]
+    fn ide_watcher_excludes_skip_dirs_in_watch_collection() {
+        let dir = unique_temp_dir("gitcomet-monitor-ide-excludes");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join("node_modules").join("pkg")).expect("create node_modules");
+        fs::create_dir_all(workdir.join("src")).expect("create src");
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {"**/node_modules": true}}"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut gitignore = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, true);
+
+        let dirs = collect_watchable_dirs(
+            &workdir,
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut excludes,
+        );
+        assert!(
+            !dirs.contains(&workdir.join("node_modules")),
+            "excluded dir must not be watched"
+        );
+        assert!(
+            !dirs.contains(&workdir.join("node_modules").join("pkg")),
+            "excluded subtree must not be watched"
+        );
+        assert!(
+            dirs.contains(&workdir.join("src")),
+            "non-excluded dirs must stay watched"
+        );
+
+        // Disabled rule set: everything is watched again (T2.1/T2.6 parity).
+        let mut disabled = WatcherExcludes::load(&workdir, false);
+        let dirs = collect_watchable_dirs(
+            &workdir,
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut disabled,
+        );
+        assert!(dirs.contains(&workdir.join("node_modules")));
+        assert!(dirs.contains(&workdir.join("node_modules").join("pkg")));
+    }
+
+    #[test]
+    fn ide_watcher_excludes_suppress_classify_events() {
+        let dir = unique_temp_dir("gitcomet-monitor-ide-excludes");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join("repos")).expect("create repos");
+        fs::write(workdir.join("repos").join("file.txt"), "x").expect("write excluded file");
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {"repos/": true}}"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut rules = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, true);
+
+        let excluded_event = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![workdir.join("repos").join("file.txt")],
+            attrs: Default::default(),
+        };
+        assert_eq!(
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut excludes,
+                &excluded_event
+            ),
+            None,
+            "events under an IDE-excluded path must not trigger a refresh"
+        );
+
+        // Git-state events still land even in excluded worktrees.
+        let git_head = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![workdir.join(".git").join("HEAD")],
+            attrs: Default::default(),
+        };
+        assert_eq!(
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut excludes,
+                &git_head
+            ),
+            Some(RepoExternalChange::GitState)
+        );
+
+        // A mixed event keeps the non-excluded contribution (no worktree flag).
+        let mixed = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![
+                workdir.join(".git").join("HEAD"),
+                workdir.join("repos").join("file.txt"),
+            ],
+            attrs: Default::default(),
+        };
+        let change = classify_change(
+            &workdir,
+            git_dir.as_deref(),
+            &mut rules,
+            &mut excludes,
+            &mixed,
+        )
+        .expect("git-state contribution must survive");
+        assert!(!change.worktree, "excluded worktree part must be dropped");
+        assert!(change.git_state);
+    }
+
+    #[test]
+    fn ide_watcher_excludes_config_change_reloads_rules() {
+        let dir = unique_temp_dir("gitcomet-monitor-ide-excludes");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::create_dir_all(workdir.join("node_modules")).expect("create node_modules");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {}}"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut gitignore = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, true);
+        assert!(
+            collect_watchable_dirs(
+                &workdir,
+                &workdir,
+                git_dir.as_deref(),
+                &mut gitignore,
+                &mut excludes
+            )
+            .contains(&workdir.join("node_modules")),
+            "before the config change node_modules is watched"
+        );
+
+        // Editing the config file must be classified as a rules-changed event AND
+        // reload the rule set in place (T2.3).
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {"**/node_modules": true}}"#,
+        )
+        .expect("rewrite settings.json");
+        let config_event = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![WatcherExcludes::config_path(&workdir)],
+            attrs: Default::default(),
+        };
+        let classified = classify_repo_event(
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut excludes,
+            &config_event,
+        );
+        assert!(
+            classified.rules_changed,
+            "settings.json events must signal a watch-rule change"
+        );
+        assert_eq!(classified.change, Some(RepoExternalChange::worktree()));
+
+        // The reloaded excludes now exclude node_modules from the watch set.
+        assert!(
+            !collect_watchable_dirs(
+                &workdir,
+                &workdir,
+                git_dir.as_deref(),
+                &mut gitignore,
+                &mut excludes
+            )
+            .contains(&workdir.join("node_modules")),
+            "post-reload rules must apply to the watch set"
+        );
+    }
+
+    #[test]
+    fn ide_watcher_excludes_config_change_is_flagged_when_disabled() {
+        let dir = unique_temp_dir("gitcomet-monitor-ide-excludes");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {"**/node_modules": true}}"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut gitignore = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, false);
+
+        let config_event = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![WatcherExcludes::config_path(&workdir)],
+            attrs: Default::default(),
+        };
+        let classified = classify_repo_event(
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut excludes,
+            &config_event,
+        );
+        assert!(
+            classified.rules_changed,
+            "the config path must be recognized even when the setting is off"
+        );
+        assert!(
+            !excludes.is_excluded(Path::new("node_modules"), Some(true)),
+            "a disabled rule set must stay empty after reload"
+        );
+    }
+
+    #[test]
+    fn vscode_dir_stays_watchable_under_catchall_excludes() {
+        let dir = unique_temp_dir("gitcomet-monitor-ide-excludes");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::create_dir_all(workdir.join("a").join(".vscode")).expect("create nested .vscode");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {"**/.vscode": true}}"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut gitignore = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, true);
+
+        let dirs = collect_watchable_dirs(
+            &workdir,
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut excludes,
+        );
+        assert!(
+            dirs.contains(&workdir.join(".vscode")),
+            "the config dir must always be watchable (T2.4)"
+        );
+        assert!(
+            !dirs.contains(&workdir.join("a").join(".vscode")),
+            "other .vscode dirs still obey the exclude pattern"
+        );
+    }
+
+    #[test]
+    fn ide_excludes_apply_even_to_tracked_files() {
+        let dir = unique_temp_dir("gitcomet-monitor-ide-excludes");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join("repos")).expect("create repos");
+        fs::write(workdir.join("repos").join("tracked.txt"), "x").expect("write tracked file");
+        run_git(&workdir, &["add", "repos/tracked.txt"]);
+        run_git(&workdir, &["commit", "-m", "track excluded file"]);
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{"files.watcherExclude": {"repos/": true}}"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut rules = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, true);
+
+        let tracked_in_excluded = notify::Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![workdir.join("repos").join("tracked.txt")],
+            attrs: Default::default(),
+        };
+        assert_eq!(
+            classify_change(
+                &workdir,
+                git_dir.as_deref(),
+                &mut rules,
+                &mut excludes,
+                &tracked_in_excluded
+            ),
+            None,
+            "IDE excludes apply even to tracked files (T2.7/AE6)"
         );
     }
 }

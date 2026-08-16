@@ -562,7 +562,7 @@ impl<T: Clone + PartialEq> NavStack<T> {
 
 // ── App state ───────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AppState {
     pub repos: Vec<RepoState>,
     pub active_repo: Option<RepoId>,
@@ -580,6 +580,31 @@ pub struct AppState {
     pub git_log_settings: GitLogSettings,
     pub sidebar_mode: SidebarMode,
     pub default_tag_type: DefaultTagType,
+    /// Whether the repo file watcher respects IDE watcher-exclude settings
+    /// (`.vscode/settings.json` `files.watcherExclude`). Defaults to enabled;
+    /// a derive-based `Default` would start a bare `bool` at `false` and invert
+    /// that for store-only startup paths, so `Default` is implemented manually.
+    pub respect_ide_watch_excludes: bool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            repos: Vec::new(),
+            active_repo: None,
+            clone: None,
+            notifications: Vec::new(),
+            banner_error: None,
+            auth_prompt: None,
+            submodule_trust_prompt: None,
+            submodule_trust_check_pending: None,
+            git_runtime: GitRuntimeState::default(),
+            git_log_settings: GitLogSettings::default(),
+            sidebar_mode: SidebarMode::default(),
+            default_tag_type: DefaultTagType::default(),
+            respect_ide_watch_excludes: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
