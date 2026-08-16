@@ -51,7 +51,7 @@ convert_worktree_gitfile_to_relative() {
 }
 
 WORKTREE_PATH="${1:?worktree_path required}"
-PRIMARY_PATH="${2:-$(resolve_primary_repo "$WORKTREE_PATH" 2>/dev/null)}"
+PRIMARY_PATH="${2:-$(resolve_primary_repo "$WORKTREE_PATH" 2>/dev/null || true)}"
 
 # GitKraken (libgit2) compat — runtime-guarded: one canonical content for every
 # machine, skipped with a single log line where GitKraken is absent (SH1).

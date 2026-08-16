@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib.sh"
 
 WORKTREE_PATH="${1:?worktree_path required}"
-PRIMARY_PATH="${2:-$(resolve_primary_repo "$WORKTREE_PATH" 2>/dev/null)}"
+PRIMARY_PATH="${2:-$(resolve_primary_repo "$WORKTREE_PATH" 2>/dev/null || true)}"
 
 if [[ -z "$PRIMARY_PATH" || "$PRIMARY_PATH" == "$WORKTREE_PATH" ]]; then
     echo "copy-codegraph: no separate primary worktree, skipping"
