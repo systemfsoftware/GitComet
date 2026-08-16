@@ -867,6 +867,10 @@ fn reduce_inner(
             state.git_log_settings.tag_fetch_mode = tag_fetch_mode;
             Vec::new()
         }
+        Msg::SetRespectIdeWatcherExcludesEnabled(enabled) => {
+            state.respect_ide_watch_excludes = enabled;
+            Vec::new()
+        }
         Msg::SetDefaultTagType(tag_type) => {
             state.default_tag_type = tag_type;
             Vec::new()
@@ -2371,6 +2375,20 @@ mod nav_history_tests {
 
     fn repo(state: &AppState, repo_id: RepoId) -> &RepoState {
         state.repos.iter().find(|r| r.id == repo_id).unwrap()
+    }
+
+    #[test]
+    fn set_respect_ide_watcher_excludes_updates_state() {
+        let mut state = AppState::default();
+        assert!(
+            state.respect_ide_watch_excludes,
+            "the default state must respect IDE watcher excludes"
+        );
+        dispatch(&mut state, Msg::SetRespectIdeWatcherExcludesEnabled(false));
+        assert!(!state.respect_ide_watch_excludes);
+        assert_eq!(state.notifications.len(), 0, "no side effects");
+        dispatch(&mut state, Msg::SetRespectIdeWatcherExcludesEnabled(true));
+        assert!(state.respect_ide_watch_excludes);
     }
 
     #[test]

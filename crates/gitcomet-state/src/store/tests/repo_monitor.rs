@@ -249,6 +249,7 @@ fn repo_monitor_start_failures_are_recorded_for_missing_workdir() {
         missing_workdir,
         msg_tx,
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        true,
     );
 
     wait_for_monitor_failure_count(monitor_impl::MonitorFailureKind::Start, before + 1);
@@ -374,6 +375,176 @@ fn repo_monitor_join_failures_are_recorded() {
 
     let after = monitor_impl::monitor_failure_count(monitor_impl::MonitorFailureKind::Join);
     assert!(after > before);
+}
+
+#[test]
+fn sync_active_repo_restarts_monitor_exactly_when_setting_changes() {
+    let mut monitors = monitor_impl::RepoMonitorManager::new();
+    let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<Msg>();
+    let thread_msg_tx =
+        super::super::worker_channel::StoreWorkerSender::for_test_msg_sender(msg_tx);
+    let active_repo_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let workdir = tempfile::Builder::new()
+        .prefix("gitcomet-monitor-sync")
+        .tempdir()
+        .expect("create tempdir");
+    let workdir_path = workdir.path().to_path_buf();
+
+    // Phase 1: a monitor is already running and the first sync must
+    // force-restart it (the previously-applied setting is unknown).
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+    let old_enabled = monitors.insert_blocked_monitor_for_test(RepoId(1), release_rx, exited_tx);
+    assert!(monitors.is_running(RepoId(1)));
+    monitors.sync_active_repo(
+        Some(RepoId(1)),
+        Some(workdir_path.clone()),
+        true,
+        thread_msg_tx.clone(),
+        active_repo_id.clone(),
+    );
+    release_tx
+        .send(())
+        .expect("test monitor release signal should send");
+    exited_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("old monitor thread should exit after the config restart");
+    assert!(!old_enabled.load(Ordering::Relaxed));
+    assert!(
+        monitors.is_running(RepoId(1)),
+        "a replacement monitor must run after the config restart"
+    );
+    let replacement_thread = monitors
+        .monitor_thread_id(RepoId(1))
+        .expect("replacement monitor thread must be observable");
+
+    // Phase 2: the same setting again — no restart, the monitor stays up. The
+    // thread identity must be unchanged: `is_running` alone cannot
+    // distinguish a no-op from a spurious stop+start (review finding 8).
+    monitors.sync_active_repo(
+        Some(RepoId(1)),
+        Some(workdir_path.clone()),
+        true,
+        thread_msg_tx.clone(),
+        active_repo_id.clone(),
+    );
+    assert!(
+        monitors.is_running(RepoId(1)),
+        "same-config sync must not tear the monitor down"
+    );
+    assert_eq!(
+        monitors.monitor_thread_id(RepoId(1)),
+        Some(replacement_thread),
+        "same-config sync must not restart the monitor thread"
+    );
+
+    // Phase 3: toggling the setting while a monitor runs force-restarts it.
+    // Switch the active repo to a repo whose stand-in monitor is observable,
+    // then flip the setting: the old stand-in must be stopped (exited) and a
+    // replacement monitor must run with the new config.
+    let (release_tx2, release_rx2) = std::sync::mpsc::channel();
+    let (exited_tx2, exited_rx2) = std::sync::mpsc::channel();
+    let second_enabled =
+        monitors.insert_blocked_monitor_for_test(RepoId(2), release_rx2, exited_tx2);
+    assert!(monitors.is_running(RepoId(2)));
+    monitors.sync_active_repo(
+        Some(RepoId(2)),
+        Some(workdir_path.clone()),
+        false,
+        thread_msg_tx.clone(),
+        active_repo_id.clone(),
+    );
+    assert!(
+        !monitors.is_running(RepoId(1)),
+        "the inactive repo's monitor must be stopped by the sync"
+    );
+    release_tx2
+        .send(())
+        .expect("test monitor release signal should send");
+    exited_rx2
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("second monitor should exit after the toggle restart");
+    assert!(!second_enabled.load(Ordering::Relaxed));
+    assert!(
+        monitors.is_running(RepoId(2)),
+        "the monitor with the toggled setting must be running"
+    );
+
+    monitors.stop_all();
+}
+
+#[test]
+fn sync_active_repo_keeps_excludes_setting_when_workdir_is_missing() {
+    // Review finding 7: a sync with the repo still active but the workdir
+    // metadata momentarily missing must not clear the cached setting — doing
+    // so force-restarts the running monitor on the very next sync.
+    let mut monitors = monitor_impl::RepoMonitorManager::new();
+    let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<Msg>();
+    let thread_msg_tx =
+        super::super::worker_channel::StoreWorkerSender::for_test_msg_sender(msg_tx);
+    let active_repo_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let workdir = tempfile::Builder::new()
+        .prefix("gitcomet-monitor-sync-workdir")
+        .tempdir()
+        .expect("create tempdir");
+    let workdir_path = workdir.path().to_path_buf();
+
+    // First sync establishes the setting and starts a monitor.
+    monitors.sync_active_repo(
+        Some(RepoId(1)),
+        Some(workdir_path.clone()),
+        true,
+        thread_msg_tx.clone(),
+        active_repo_id.clone(),
+    );
+    let thread_after_first_sync = monitors
+        .monitor_thread_id(RepoId(1))
+        .expect("monitor must be running after the first sync");
+
+    // Workdir metadata missing: no restart, cached setting left in place.
+    monitors.sync_active_repo(
+        Some(RepoId(1)),
+        None,
+        false,
+        thread_msg_tx.clone(),
+        active_repo_id.clone(),
+    );
+    assert_eq!(
+        monitors.monitor_thread_id(RepoId(1)),
+        Some(thread_after_first_sync),
+        "a missing workdir must not restart the monitor"
+    );
+
+    // Workdir back with the SAME setting: still no restart (the cached
+    // setting was not cleared, so no config-change restart is triggered).
+    monitors.sync_active_repo(
+        Some(RepoId(1)),
+        Some(workdir_path.clone()),
+        true,
+        thread_msg_tx.clone(),
+        active_repo_id.clone(),
+    );
+    assert_eq!(
+        monitors.monitor_thread_id(RepoId(1)),
+        Some(thread_after_first_sync),
+        "restoring the workdir with an unchanged setting must not restart"
+    );
+
+    // A real toggle still force-restarts.
+    monitors.sync_active_repo(
+        Some(RepoId(1)),
+        Some(workdir_path.clone()),
+        false,
+        thread_msg_tx.clone(),
+        active_repo_id.clone(),
+    );
+    assert_ne!(
+        monitors.monitor_thread_id(RepoId(1)),
+        Some(thread_after_first_sync),
+        "a real setting change must restart the monitor (KTD5)"
+    );
+
+    monitors.stop_all();
 }
 
 #[test]

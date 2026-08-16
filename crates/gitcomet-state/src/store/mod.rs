@@ -18,6 +18,7 @@ mod reducer_diagnostics;
 mod repo_load_trace;
 mod repo_monitor;
 mod send_diagnostics;
+mod watcher_excludes;
 mod worker_channel;
 
 use effects::RepoTaskToken;
@@ -195,36 +196,32 @@ where
 
     // Keep filesystem monitoring scoped to the active repository only, to minimize
     // OS watcher load in large multi-repo sessions.
-    let (active_repo, active_workdir) = {
+    let (active_repo, active_workdir, respect_ide_watch_excludes) = {
         let state = ctx.thread_state.read().unwrap_or_else(|e| e.into_inner());
-        let active_repo = state.active_repo;
-        let active_workdir = active_repo.and_then(|repo_id| {
+        let active_workdir = state.active_repo.and_then(|repo_id| {
             state
                 .repos
                 .iter()
                 .find(|r| r.id == repo_id)
                 .map(|r| r.spec.workdir.clone())
         });
-        (active_repo, active_workdir)
+        (
+            state.active_repo,
+            active_workdir,
+            state.respect_ide_watch_excludes,
+        )
     };
+    // Only start a monitor for a repo the backend map actually holds; the state
+    // may know the workdir before the repo is registered with the executor.
+    let active_repo = active_repo.filter(|repo_id| ctx.repos.contains_key(repo_id));
 
-    for repo_id in ctx.repo_monitors.running_repo_ids() {
-        if Some(repo_id) != active_repo {
-            ctx.repo_monitors.stop(repo_id);
-        }
-    }
-
-    if let Some(repo_id) = active_repo
-        && let Some(workdir) = active_workdir
-        && ctx.repos.contains_key(&repo_id)
-    {
-        ctx.repo_monitors.start(
-            repo_id,
-            workdir,
-            ctx.thread_msg_tx.clone(),
-            Arc::clone(ctx.active_repo_id),
-        );
-    }
+    ctx.repo_monitors.sync_active_repo(
+        active_repo,
+        active_workdir,
+        respect_ide_watch_excludes,
+        ctx.thread_msg_tx.clone(),
+        Arc::clone(ctx.active_repo_id),
+    );
 
     for effect in effects {
         if repo_load_trace::enabled() {

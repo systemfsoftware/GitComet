@@ -174,6 +174,10 @@ pub enum Msg {
         show_history_tags: bool,
         tag_fetch_mode: GitLogTagFetchMode,
     },
+    /// Whether the repo file watcher respects IDE watcher-exclude settings
+    /// (`.vscode/settings.json` `files.watcherExclude`). Toggling while a repo
+    /// is active restarts that repo's monitor with the new configuration.
+    SetRespectIdeWatcherExcludesEnabled(bool),
     SetDefaultTagType(DefaultTagType),
     SetActiveRepo {
         repo_id: RepoId,

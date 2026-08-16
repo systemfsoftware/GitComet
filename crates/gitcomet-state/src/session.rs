@@ -1,4 +1,6 @@
-use crate::model::{AppState, DefaultTagType, GitLogTagFetchMode, RepoId};
+use crate::model::{
+    AppState, DEFAULT_RESPECT_IDE_WATCH_EXCLUDES, DefaultTagType, GitLogTagFetchMode, RepoId,
+};
 use gitcomet_core::domain::{HistoryMode, LogScope};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,7 @@ pub struct UiSession {
     pub date_time_format: Option<String>,
     pub timezone: Option<String>,
     pub show_timezone: Option<bool>,
+    pub respect_ide_watch_excludes: Option<bool>,
     pub change_tracking_view: Option<String>,
     pub diff_scroll_sync: Option<String>,
     pub diff_content_mode: Option<String>,
@@ -73,6 +76,16 @@ pub struct UiSession {
     pub default_tag_type: Option<DefaultTagType>,
     pub git_executable_path: Option<PathBuf>,
     pub external_code_editor: Option<ExternalCodeEditorSetting>,
+}
+
+impl UiSession {
+    /// Whether IDE watcher excludes are respected, defaulting to enabled when
+    /// the session has no stored value. Single resolution point for the
+    /// setting's default so UI entry points cannot drift (review finding 15).
+    pub fn respect_ide_watch_excludes_enabled(&self) -> bool {
+        self.respect_ide_watch_excludes
+            .unwrap_or(DEFAULT_RESPECT_IDE_WATCH_EXCLUDES)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,6 +193,7 @@ struct UiSessionFile {
     date_time_format: Option<String>,
     timezone: Option<String>,
     show_timezone: Option<bool>,
+    respect_ide_watch_excludes: Option<bool>,
     change_tracking_view: Option<String>,
     diff_scroll_sync: Option<String>,
     diff_content_mode: Option<String>,
@@ -302,6 +316,7 @@ pub fn load_from_path(path: &Path) -> UiSession {
         date_time_format: file.date_time_format,
         timezone: file.timezone,
         show_timezone: file.show_timezone,
+        respect_ide_watch_excludes: file.respect_ide_watch_excludes,
         change_tracking_view: file.change_tracking_view,
         diff_scroll_sync: file.diff_scroll_sync,
         diff_content_mode: file.diff_content_mode,
@@ -745,6 +760,7 @@ pub struct UiSettings {
     pub date_time_format: Option<String>,
     pub timezone: Option<String>,
     pub show_timezone: Option<bool>,
+    pub respect_ide_watch_excludes: Option<bool>,
     pub change_tracking_view: Option<String>,
     pub repo_picker_sort: Option<String>,
     /// Whole replacement set — the repository picker owns it and always writes
@@ -840,6 +856,9 @@ pub fn persist_ui_settings_to_path(settings: UiSettings, path: &Path) -> io::Res
         }
         if let Some(value) = settings.show_timezone {
             file.show_timezone = Some(value);
+        }
+        if let Some(value) = settings.respect_ide_watch_excludes {
+            file.respect_ide_watch_excludes = Some(value);
         }
         if let Some(value) = settings.change_tracking_view {
             file.change_tracking_view = Some(value);
@@ -1965,6 +1984,44 @@ mod tests {
         assert_session_writer_waits_for_shared_lock("persist-survey-postponed", |path| {
             persist_survey_prompt_postponed_to_path(&path, "survey", 60, 123)
         });
+    }
+
+    #[test]
+    fn respect_ide_watch_excludes_round_trips() {
+        let dir = tempfile::Builder::new()
+            .prefix("gitcomet-session-ide-excludes")
+            .tempdir()
+            .expect("create tempdir");
+        let path = dir.path().join("session.json");
+
+        // Default: the field is never written (None) and old session files
+        // without it load as None (backward compatible).
+        persist_ui_settings_to_path(UiSettings::default(), &path).expect("persist default");
+        assert_eq!(load_from_path(&path).respect_ide_watch_excludes, None);
+
+        // Explicit false survives a round trip.
+        persist_ui_settings_to_path(
+            UiSettings {
+                respect_ide_watch_excludes: Some(false),
+                ..UiSettings::default()
+            },
+            &path,
+        )
+        .expect("persist false");
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.respect_ide_watch_excludes, Some(false));
+
+        // And so does true.
+        persist_ui_settings_to_path(
+            UiSettings {
+                respect_ide_watch_excludes: Some(true),
+                ..UiSettings::default()
+            },
+            &path,
+        )
+        .expect("persist true");
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.respect_ide_watch_excludes, Some(true));
     }
 
     #[test]
