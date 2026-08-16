@@ -1422,6 +1422,10 @@ impl GitCometView {
             tag_fetch_mode: history_tag_fetch_mode,
         });
         store.dispatch(Msg::SetDefaultTagType(default_tag_type));
+        let respect_ide_watch_excludes = ui_session.respect_ide_watch_excludes.unwrap_or(true);
+        store.dispatch(Msg::SetRespectIdeWatcherExcludesEnabled(
+            respect_ide_watch_excludes,
+        ));
         let saved_open_repos = ui_session.open_repos.clone();
         let saved_active_repo = ui_session.active_repo.clone();
         let mut startup_repo_bootstrap_pending = false;

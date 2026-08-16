@@ -412,6 +412,7 @@ pub(crate) struct SettingsWindowView {
     timezone: Timezone,
     show_timezone: bool,
     change_tracking_view: ChangeTrackingView,
+    respect_ide_watch_excludes: bool,
     terminal_preferences: TerminalPreferences,
     terminal_external_program_input: Entity<components::TextInput>,
     terminal_external_args_input: Entity<components::TextInput>,
@@ -817,6 +818,7 @@ impl SettingsWindowView {
             .as_deref()
             .and_then(ChangeTrackingView::from_key)
             .unwrap_or_default();
+        let respect_ide_watch_excludes = ui_session.respect_ide_watch_excludes.unwrap_or(true);
         let terminal_preferences = TerminalPreferences::from_ui_session(&ui_session);
         let diff_scroll_sync = ui_session
             .diff_scroll_sync
@@ -1065,6 +1067,7 @@ impl SettingsWindowView {
             timezone,
             show_timezone,
             change_tracking_view,
+            respect_ide_watch_excludes,
             terminal_preferences,
             terminal_external_program_input,
             terminal_external_args_input,
@@ -1170,6 +1173,7 @@ impl SettingsWindowView {
             timezone: Some(self.timezone.key()),
             show_timezone: Some(self.show_timezone),
             change_tracking_view: Some(self.change_tracking_view.key().to_string()),
+            respect_ide_watch_excludes: Some(self.respect_ide_watch_excludes),
             diff_scroll_sync: Some(self.diff_scroll_sync.key().to_string()),
             diff_content_mode: Some(self.diff_content_mode.key().to_string()),
             diff_whitespace_mode: Some(self.diff_whitespace_mode.key().to_string()),
@@ -1789,6 +1793,20 @@ impl SettingsWindowView {
             view.popover_host.update(cx, |host, cx| {
                 host.set_show_timezone(enabled, cx);
             });
+        });
+        cx.notify();
+    }
+
+    fn set_respect_ide_watch_excludes(&mut self, enabled: bool, cx: &mut gpui::Context<Self>) {
+        if self.respect_ide_watch_excludes == enabled {
+            return;
+        }
+
+        self.respect_ide_watch_excludes = enabled;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, _cx| {
+            view.store
+                .dispatch(Msg::SetRespectIdeWatcherExcludesEnabled(enabled));
         });
         cx.notify();
     }
@@ -4479,13 +4497,45 @@ impl Render for SettingsWindowView {
                         );
                     }
 
+                    let respect_ide_watch_excludes_row = self
+                        .toggle_row(
+                            "settings_window_respect_ide_watch_excludes",
+                            "Respect IDE watcher excludes",
+                            self.respect_ide_watch_excludes,
+                            theme,
+                        )
+                        .border_color(if self.respect_ide_watch_excludes {
+                            settings_row_separator_color(theme)
+                        } else {
+                            no_separator
+                        })
+                        .on_click(cx.listener(|this, _e: &ClickEvent, _window, cx| {
+                            this.set_respect_ide_watch_excludes(
+                                !this.respect_ide_watch_excludes,
+                                cx,
+                            );
+                        }));
+
                     let mut change_tracking_card = self
                         .card(
                             "settings_window_change_tracking_card",
                             "Change tracking",
                             theme,
                         )
-                        .child(change_tracking_row);
+                        .child(change_tracking_row)
+                        .child(respect_ide_watch_excludes_row)
+                        .child(
+                            div()
+                                .id("settings_window_respect_ide_watch_excludes_caption")
+                                .w_full()
+                                .px_2()
+                                .pb_2()
+                                .text_xs()
+                                .text_color(theme.colors.foreground.secondary)
+                                .child(
+                                    "Applies .vscode/settings.json > files.watcherExclude to file watching.",
+                                ),
+                        );
 
                     if self.expanded_section == Some(SettingsSection::ChangeTracking) {
                         let list = uniform_list(
@@ -5580,6 +5630,8 @@ mod tests {
 
     const SESSION_FILE_ENV: &str = "GITCOMET_SESSION_FILE";
     const DIFF_DEFAULTS_SESSION_SUBTEST_ENV: &str = "GITCOMET_DIFF_DEFAULTS_SESSION_SUBTEST";
+    const RESPECT_IDE_WATCH_EXCLUDES_SUBTEST_ENV: &str =
+        "GITCOMET_RESPECT_IDE_WATCH_EXCLUDES_SUBTEST";
 
     struct TestBackend;
 
@@ -7329,6 +7381,158 @@ mod tests {
                 next_show_timezone
             );
         });
+    }
+
+    #[gpui::test]
+    fn respect_ide_watch_excludes_toggle_flips_setting_and_dispatches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _visual_guard = lock_visual_test();
+        let (store, events) = AppStore::new(std::sync::Arc::new(TestBackend));
+        let (main_view, cx) =
+            cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+            open_settings_window(app);
+        });
+        cx.run_until_parked();
+
+        let settings_window = cx.update(|_window, app| {
+            app.windows()
+                .into_iter()
+                .find_map(|window| window.downcast::<SettingsWindowView>())
+                .expect("settings window should be open")
+        });
+
+        // T4.1: the setting starts enabled and is mirrored into the store.
+        assert!(cx.update(|_window, app| {
+            settings_window
+                .read_with(app, |settings, _cx| settings.respect_ide_watch_excludes)
+                .expect("settings window should be readable")
+        }));
+        assert!(cx.update(|_window, app| {
+            main_view
+                .read(app)
+                .store
+                .snapshot()
+                .respect_ide_watch_excludes
+        }));
+
+        // T4.2: the toggle handler flips the field, persists, and dispatches
+        // the message to the store.
+        cx.update(|_window, app| {
+            main_view.update(app, |_view, cx| {
+                let _ = settings_window.update(cx, |settings, _window, cx| {
+                    settings.set_respect_ide_watch_excludes(false, cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        let store_mirrored = |app: &App| {
+            main_view
+                .read(app)
+                .store
+                .snapshot()
+                .respect_ide_watch_excludes
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let mirrored = cx.update(|_window, app| store_mirrored(app));
+            if !mirrored {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the store must receive the toggle"
+            );
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.update(|_window, app| {
+            assert!(
+                !settings_window
+                    .read_with(app, |settings, _cx| settings.respect_ide_watch_excludes)
+                    .expect("settings window should remain readable")
+            );
+        });
+
+        // And back on: the store follows the last click.
+        cx.update(|_window, app| {
+            main_view.update(app, |_view, cx| {
+                let _ = settings_window.update(cx, |settings, _window, cx| {
+                    settings.set_respect_ide_watch_excludes(true, cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let mirrored = cx.update(|_window, app| store_mirrored(app));
+            if mirrored {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the store must receive the toggle back on"
+            );
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[gpui::test]
+    fn respect_ide_watch_excludes_boot_dispatch_applies_restored_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The session file must be seeded before the window is created, and the
+        // session-file env var is process-global — run the window part in a
+        // subprocess, mirroring the diff-defaults subtest convention.
+        if std::env::var(RESPECT_IDE_WATCH_EXCLUDES_SUBTEST_ENV).is_err() {
+            let session_file = unique_session_file("respect-ide-watch-excludes");
+            gitcomet_state::session::persist_ui_settings_to_path(
+                gitcomet_state::session::UiSettings {
+                    respect_ide_watch_excludes: Some(false),
+                    ..gitcomet_state::session::UiSettings::default()
+                },
+                &session_file,
+            )
+            .expect("persist seeded session");
+
+            let current_exe = std::env::current_exe().expect("locate current test binary");
+            let output = Command::new(current_exe)
+                .arg("respect_ide_watch_excludes_boot_dispatch_applies_restored_session")
+                .arg("--nocapture")
+                .env(SESSION_FILE_ENV, session_file)
+                .env(RESPECT_IDE_WATCH_EXCLUDES_SUBTEST_ENV, "1")
+                .output()
+                .expect("spawn boot-dispatch subtest process");
+            assert!(
+                output.status.success(),
+                "subtest failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let _visual_guard = lock_visual_test();
+        let (store, events) = AppStore::new(std::sync::Arc::new(TestBackend));
+        let (main_view, cx) =
+            cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+        cx.run_until_parked();
+
+        let enabled = cx.update(|_window, app| {
+            main_view
+                .read(app)
+                .store
+                .snapshot()
+                .respect_ide_watch_excludes
+        });
+        assert!(
+            !enabled,
+            "the boot dispatch must apply the restored false setting before any repo activates"
+        );
     }
 
     #[gpui::test]
