@@ -13,7 +13,9 @@ WORKTREE_PATH="${1:?worktree_path required}"
     shopt -s nullglob
     for pattern in "${ISSUE_SYMLINK_GLOBS[@]}"; do
         for symlink_path in "$WORKTREE_PATH"/$pattern; do
-            [[ -L "$symlink_path" ]] && rm -f "$symlink_path" && echo "pre-merge: removed symlinked issue $(basename "$symlink_path")"
+            if [[ -L "$symlink_path" ]]; then
+                rm -f "$symlink_path" && echo "pre-merge: removed symlinked issue $(basename "$symlink_path")" || true
+            fi
         done
     done
 )

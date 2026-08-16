@@ -8,8 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/worktrunk/lib.sh
 . "$SCRIPT_DIR/lib.sh"
 
-WORKTREES_ROOT="${1:-/mnt/shared/.worktrees}"
-MAIN_REPO="${2:-/mnt/shared}"
+WORKTREES_ROOT="${1:?convert-to-relative: worktrees root required}"
 
 convert_worktree_to_relative() {
     local worktree_path="$1"
@@ -58,9 +57,9 @@ for worktree_dir in "$WORKTREES_ROOT"/*/; do
     echo "[$worktree_name]"
 
     if convert_worktree_to_relative "$worktree_dir"; then
-        ((converted++))
+        ((converted++)) || true
     else
-        ((failed++))
+        ((failed++)) || true
     fi
     echo ""
 done

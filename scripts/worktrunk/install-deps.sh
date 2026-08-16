@@ -53,7 +53,7 @@ case "$MANAGER" in
         fi
         ;;
     *)
-        echo "install-deps: no recognized package manager, skipping"
+        loud_fail "$MANAGER"
         ;;
 esac
 

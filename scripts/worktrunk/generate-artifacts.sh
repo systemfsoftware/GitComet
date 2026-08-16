@@ -49,7 +49,7 @@ case "$MANAGER" in
         fi
         ;;
     *)
-        echo "generate-artifacts: no recognized build system, skipping"
+        loud_fail "$MANAGER"
         ;;
 esac
 

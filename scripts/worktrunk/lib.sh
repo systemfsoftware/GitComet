@@ -68,3 +68,29 @@ detect_manager() {
         return 1
     fi
 }
+
+# Rewrite an absolute gitdir entry in place to a path relative to the entry
+# file's directory. Returns 0 on conversion; 1 when skipped (relative already,
+# non-absolute, or not a file). Echoes nothing — callers own their logging.
+convert_gitdir_entry() {
+    local entry="$1" target rel
+    [[ -f "$entry" ]] || return 1
+    target=$(cat "$entry")
+    [[ "$target" == /* ]] || return 1
+    rel=$(realpath --relative-to="$(dirname "$entry")" "$target" 2>/dev/null) || return 1
+    echo "$rel" > "$entry"
+}
+
+# Rewrite a worktree's `.git` file from an absolute `gitdir:` line to a
+# relative one. Returns 0 on conversion, 1 when skipped (no file, no gitdir
+# line, already relative, or unresolvable). Echoes nothing.
+convert_worktree_gitfile() {
+    local wt="$1" line abs rel
+    [[ -f "$wt/.git" ]] || return 1
+    line=$(head -1 "$wt/.git")
+    [[ "$line" == gitdir:* ]] || return 1
+    abs="${line#gitdir: }"
+    [[ "$abs" == /* ]] || return 1
+    rel=$(realpath --relative-to="$wt" "$abs" 2>/dev/null) || return 1
+    echo "gitdir: $rel" > "$wt/.git"
+}

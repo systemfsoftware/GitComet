@@ -43,16 +43,15 @@ fi
 
 mkdir -p "$DST_DIR"
 
-if command -v sqlite3 &>/dev/null; then
+# A live SQLite DB must not be copied without a consistent snapshot: a raw
+# reflink copy can warm-start a torn index. When sqlite3 .backup is
+# unavailable or fails, skip — the daemon indexes fresh.
+if command -v sqlite3 >/dev/null 2>&1; then
     if sqlite3 "$SRC_DB" ".backup '$DST_DB'" 2>/dev/null; then
         echo "copy-codegraph: index warm-started (sqlite backup)"
         exit 0
     fi
-    echo "copy-codegraph: sqlite backup failed, falling back to reflink copy"
-fi
-
-if cp --reflink=auto "$SRC_DB" "$DST_DB" 2>/dev/null; then
-    echo "copy-codegraph: index warm-started (reflink copy)"
+    echo "copy-codegraph: sqlite backup failed, skipping (daemon will index fresh)"
 else
-    echo "copy-codegraph: could not copy index, skipping (daemon will index fresh)"
+    echo "copy-codegraph: sqlite3 unavailable, skipping (daemon will index fresh)"
 fi
