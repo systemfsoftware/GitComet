@@ -3769,6 +3769,9 @@ fn launch_mergetool_uses_tool_path_override_without_custom_cmd() {
             git_path_arg(&script_path).as_str(),
         ],
     );
+    // The repo-local `mergetool.fake.path` only takes effect after the same
+    // explicit consent that `mergetool.<tool>.cmd` requires.
+    allow_repo_local_mergetool_cmd(repo, "fake");
     run_git(repo, &["config", "mergetool.fake.trustExitCode", "true"]);
 
     let backend = GixBackend;

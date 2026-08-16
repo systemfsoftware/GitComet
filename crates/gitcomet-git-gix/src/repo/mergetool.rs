@@ -32,6 +32,10 @@ impl GixRepo {
     ///    `mergetool.<tool>.trustExitCode`, then `mergetool.trustExitCode`.
     /// 5. Reads back the merged file and stages it on success.
     pub(super) fn launch_mergetool_impl(&self, path: &Path) -> Result<MergetoolResult> {
+        // `path` originates from index entries (path_buf_from_git_bytes), so a
+        // hostile repository controls it completely; reject anything that could
+        // escape the worktree before it reaches stage/merged paths.
+        let conflict_path = sanitize_conflict_path_for_worktree(path)?;
         let workdir = &self.spec.workdir;
         let repo = self.reopen_repo()?;
         let MergetoolConfig {
@@ -45,7 +49,7 @@ impl GixRepo {
         let stage_paths = materialize_mergetool_stage_files(
             &repo,
             workdir,
-            path,
+            &conflict_path,
             write_to_temp,
             keep_temporaries,
         )?;
@@ -53,7 +57,7 @@ impl GixRepo {
         let base_path = &stage_paths.base;
         let local_path = &stage_paths.local;
         let remote_path = &stage_paths.remote;
-        let merged_path = workdir.join(normalize_path_for_platform(path));
+        let merged_path = workdir.join(&conflict_path);
 
         // 4. Snapshot merged contents before tool invocation so we can
         //    detect actual content changes when trustExitCode is false.
@@ -172,16 +176,17 @@ impl GixRepo {
                     }
                 }
 
-                // Stage the file
+                // Stage the file. Use the sanitized path: `path` is hostile
+                // (index-derived) and must never reach spawn argv.
                 let mut add = self.git_workdir_cmd();
-                add.arg("add").arg("--").arg(path);
+                add.arg("add").arg("--").arg(&conflict_path);
                 run_git_simple(add, "git add (after mergetool)")?;
 
                 Some(bytes)
             }
             MergedFileState::Missing => {
                 let mut rm = self.git_workdir_cmd();
-                rm.arg("rm").arg("--").arg(path);
+                rm.arg("rm").arg("--").arg(&conflict_path);
                 run_git_simple(rm, "git rm (after mergetool)")?;
                 None
             }
@@ -345,7 +350,7 @@ fn resolve_mergetool_config(repo: &gix::Repository, has_display: bool) -> Result
 
     let tool_name = choose_mergetool_name(merge_tool, merge_guitool, gui_default, has_display)?;
     let tool_cmd = resolve_mergetool_command_with_trust_mode(repo, &tool_name)?;
-    let tool_path = git_config_get(repo, &format!("mergetool.{tool_name}.path"))?;
+    let tool_path = resolve_mergetool_tool_path_with_trust_mode(repo, &tool_name)?;
     let trust_exit_code =
         match git_config_get_bool(repo, &format!("mergetool.{tool_name}.trustExitCode"))? {
             Some(value) => value,
@@ -364,36 +369,69 @@ fn resolve_mergetool_config(repo: &gix::Repository, has_display: bool) -> Result
     })
 }
 
-fn resolve_mergetool_command_with_trust_mode(
+/// Resolve a mergetool string config key behind the repository-local consent
+/// gate.
+///
+/// Used for `mergetool.<tool>.cmd` and `mergetool.<tool>.path`: a local-scope
+/// value would let a hostile repository choose what gets executed, so it is
+/// only honored when the user has explicitly trusted this repository/tool pair
+/// (see `repo_local_mergetool_command_allowed`); otherwise a global-scope
+/// value wins, and a missing global value is a refusal.
+fn resolve_mergetool_string_value_with_trust_mode(
     repo: &gix::Repository,
+    key: &str,
+    value_kind: &str,
     tool_name: &str,
 ) -> Result<Option<String>> {
-    let cmd_key = format!("mergetool.{tool_name}.cmd");
-    let global_cmd = git_config_get_with_scope(repo, &cmd_key, GitConfigScope::Global)?;
-    let local_cmd = git_config_get_with_scope(repo, &cmd_key, GitConfigScope::Local)?;
+    let global_value = git_config_get_with_scope(repo, key, GitConfigScope::Global)?;
+    let local_value = git_config_get_with_scope(repo, key, GitConfigScope::Local)?;
 
-    let Some(local_cmd) = local_cmd else {
-        return Ok(global_cmd);
+    let Some(local_value) = local_value else {
+        return Ok(global_value);
     };
 
     if repo_local_mergetool_command_allowed(repo, tool_name)? {
-        return Ok(Some(local_cmd));
+        return Ok(Some(local_value));
     }
 
-    if global_cmd.is_some() {
-        return Ok(global_cmd);
+    if global_value.is_some() {
+        return Ok(global_value);
     }
 
     let consent_key =
         repo_local_mergetool_command_consent_key(repo_workdir_for_mergetool(repo), tool_name);
     Err(Error::new(ErrorKind::Backend(format!(
-        "Refusing to execute repository-local mergetool command for '{tool_name}' without explicit consent.\n\
-         Blocked command from repository config:\n\
-         {local_cmd}\n\
-         To allow this command for this repository and tool, run:\n\
+        "Refusing to execute repository-local mergetool {value_kind} for '{tool_name}' without explicit consent.\n\
+         Blocked {value_kind} from repository config:\n\
+         {local_value}\n\
+         To allow this {value_kind} for this repository and tool, run:\n\
          git config --global {} true",
         consent_key,
     ))))
+}
+
+fn resolve_mergetool_command_with_trust_mode(
+    repo: &gix::Repository,
+    tool_name: &str,
+) -> Result<Option<String>> {
+    resolve_mergetool_string_value_with_trust_mode(
+        repo,
+        &format!("mergetool.{tool_name}.cmd"),
+        "command",
+        tool_name,
+    )
+}
+
+fn resolve_mergetool_tool_path_with_trust_mode(
+    repo: &gix::Repository,
+    tool_name: &str,
+) -> Result<Option<String>> {
+    resolve_mergetool_string_value_with_trust_mode(
+        repo,
+        &format!("mergetool.{tool_name}.path"),
+        "path",
+        tool_name,
+    )
 }
 
 fn repo_local_mergetool_command_allowed(repo: &gix::Repository, tool_name: &str) -> Result<bool> {
@@ -504,11 +542,11 @@ impl Drop for StagePaths {
             return;
         }
         for path in [&self.base, &self.local, &self.remote] {
-            let path = stage_path_to_fs_path(&self.workdir, path);
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {}
+            // Stage paths are built from a conflict path already sanitized by
+            // sanitize_conflict_path_for_worktree; an Err here is unreachable,
+            // and skipping cleanup is the safe outcome.
+            if let Ok(path) = stage_path_to_fs_path(&self.workdir, path) {
+                let _ = std::fs::remove_file(path); // best-effort cleanup
             }
         }
     }
@@ -665,16 +703,58 @@ fn normalize_path_for_platform(path: &Path) -> PathBuf {
     normalized
 }
 
-fn stage_path_to_fs_path(workdir: &Path, stage_path: &Path) -> PathBuf {
-    if stage_path.is_absolute() {
-        stage_path.to_path_buf()
-    } else {
-        workdir.join(stage_path)
+/// Validate a conflict path from the index before it touches the filesystem.
+///
+/// The path originates from gix index entries (`path_buf_from_git_bytes`), so
+/// a hostile repository can supply any byte sequence. Only plain relative
+/// paths are accepted: absolute paths, paths with a Windows prefix (`C:\`,
+/// `\\server\share`, `C:`), root-relative paths, and paths containing a
+/// ParentDir (`..`) component are rejected so stage and merged files can never
+/// be written outside the worktree. `normalize_path_for_platform` is applied
+/// to the accepted result (its `components()` pass already normalizes
+/// separators).
+fn sanitize_conflict_path_for_worktree(conflict_path: &Path) -> Result<PathBuf> {
+    if conflict_path.is_absolute() {
+        return Err(Error::new(ErrorKind::Backend(format!(
+            "Refusing absolute conflict path for mergetool: {}",
+            conflict_path.display()
+        ))));
     }
+    if let Some(component) = conflict_path.components().find(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        ) || matches!(
+            component,
+            std::path::Component::Normal(segment)
+                if segment.eq_ignore_ascii_case(".git")
+        )
+    }) {
+        return Err(Error::new(ErrorKind::Backend(format!(
+            "Refusing conflict path '{}' for mergetool: it must be a plain \
+             relative path inside the worktree (unsafe component: {component:?})",
+            conflict_path.display(),
+        ))));
+    }
+    Ok(normalize_path_for_platform(conflict_path))
+}
+
+fn stage_path_to_fs_path(workdir: &Path, stage_path: &Path) -> Result<PathBuf> {
+    if stage_path.is_absolute() {
+        // Absolute stage files live in a tempdir created by us (writeToTemp);
+        // their location never comes from the untrusted conflict path.
+        return Ok(stage_path.to_path_buf());
+    }
+    // Defense in depth: relative stage paths derive from the conflict path;
+    // re-check them so `..` can never escape the workdir here.
+    let sanitized = sanitize_conflict_path_for_worktree(stage_path)?;
+    Ok(workdir.join(sanitized))
 }
 
 fn write_stage_bytes(workdir: &Path, stage_path: &Path, bytes: &[u8]) -> Result<()> {
-    let path = stage_path_to_fs_path(workdir, stage_path);
+    let path = stage_path_to_fs_path(workdir, stage_path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
     }
@@ -976,6 +1056,202 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_sanitize_conflict_path_for_worktree_accepts_plain_relative_paths() {
+        for path in ["file.txt", "docs/nested/file.txt", "./file.txt"] {
+            let sanitized = sanitize_conflict_path_for_worktree(Path::new(path))
+                .unwrap_or_else(|_| panic!("expected {path:?} to be accepted"));
+            assert_eq!(sanitized, PathBuf::from(path));
+        }
+    }
+
+    #[test]
+    fn test_sanitize_conflict_path_for_worktree_rejects_parent_dir() {
+        for path in [
+            "../escape.txt",
+            "docs/../../escape.txt",
+            "docs/..",
+            "docs/../nested/file.txt",
+        ] {
+            let err = match sanitize_conflict_path_for_worktree(Path::new(path)) {
+                Ok(_) => panic!("expected {path:?} to be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err.kind(), ErrorKind::Backend(_)),
+                "path={path:?} err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_conflict_path_for_worktree_rejects_absolute_paths() {
+        for path in ["/etc/passwd", "/abs/dir/file.txt"] {
+            let err = match sanitize_conflict_path_for_worktree(Path::new(path)) {
+                Ok(_) => panic!("expected {path:?} to be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err.kind(), ErrorKind::Backend(_)),
+                "path={path:?} err={err}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sanitize_conflict_path_for_worktree_rejects_windows_prefix() {
+        for path in [
+            r"C:\escape.txt",
+            r"C:escape.txt",
+            r"\\server\share\escape.txt",
+        ] {
+            let err = match sanitize_conflict_path_for_worktree(Path::new(path)) {
+                Ok(_) => panic!("expected {path:?} to be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err.kind(), ErrorKind::Backend(_)),
+                "path={path:?} err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stage_path_to_fs_path_rejects_parent_dir_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path();
+
+        // A relative stage path carrying `..` must be refused rather than
+        // silently resolved against the workdir.
+        let err = stage_path_to_fs_path(workdir, Path::new("../../escape.txt")).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::Backend(_)), "err={err}");
+
+        // Absolute stage paths (writeToTemp) come from a tempdir created by
+        // us and still resolve unchanged.
+        let absolute_stage = workdir.join("stages").join("a_BASE_123.txt");
+        assert_eq!(
+            stage_path_to_fs_path(workdir, &absolute_stage).unwrap(),
+            absolute_stage
+        );
+    }
+
+    #[test]
+    fn test_resolve_mergetool_tool_path_with_trust_mode_blocks_repo_local_without_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path();
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("init")
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["config", "mergetool.fake.path", "/tmp/evil-tool"])
+            .output()
+            .unwrap();
+
+        let repo = open_repo(workdir);
+        let err = resolve_mergetool_tool_path_with_trust_mode(&repo, "fake").unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                ErrorKind::Backend(message)
+                    if message.contains("repository-local mergetool path for 'fake'")
+                    && message.contains("gitcomet.mergetool.allowrepolocalcmd")
+            ),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_mergetool_tool_path_with_trust_mode_uses_local_path_after_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path();
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("init")
+            .output()
+            .unwrap();
+        allow_test_repo_local_mergetool_command(workdir, "fake");
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["config", "mergetool.fake.path", "/opt/fake-tool"])
+            .output()
+            .unwrap();
+
+        let repo = open_repo(workdir);
+        let path = resolve_mergetool_tool_path_with_trust_mode(&repo, "fake").unwrap();
+        assert_eq!(path.as_deref(), Some("/opt/fake-tool"));
+    }
+
+    #[test]
+    fn test_resolve_mergetool_config_refuses_repo_local_path_without_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path();
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("init")
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["config", "merge.tool", "cli"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["config", "mergetool.cli.path", "/tmp/evil-tool"])
+            .output()
+            .unwrap();
+
+        let repo = open_repo(workdir);
+        let err = resolve_mergetool_config(&repo, false).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                ErrorKind::Backend(message) if message.contains("repository-local mergetool path for 'cli'")
+            ),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_mergetool_config_uses_local_path_with_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path();
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("init")
+            .output()
+            .unwrap();
+        allow_test_repo_local_mergetool_command(workdir, "cli");
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["config", "merge.tool", "cli"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["config", "mergetool.cli.path", "/opt/fake-tool"])
+            .output()
+            .unwrap();
+
+        let repo = open_repo(workdir);
+        let cfg = resolve_mergetool_config(&repo, false).unwrap();
+        assert_eq!(cfg.tool_path.as_deref(), Some("/opt/fake-tool"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn test_build_stage_paths_write_to_temp_false_normalizes_windows_separators() {
@@ -1263,6 +1539,9 @@ mod tests {
             .arg("init")
             .output()
             .unwrap();
+        // The path below is repository-local, so it only takes effect after
+        // explicit consent for this repository/tool pair, like `.cmd`.
+        allow_test_repo_local_mergetool_command(workdir, "gui");
 
         Command::new("git")
             .arg("-C")

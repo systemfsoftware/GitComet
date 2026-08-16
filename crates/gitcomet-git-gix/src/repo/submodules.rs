@@ -14,6 +14,7 @@ use gitcomet_core::path_utils::canonicalize_or_original;
 use gitcomet_core::services::{
     CancellationToken, CommandOutput, Result, SubmoduleTrustDecision, SubmoduleTrustTarget,
 };
+use gitcomet_core::url_redact::{redact_remote_url_userinfo, validate_remote_url};
 use gix::bstr::ByteSlice as _;
 use std::collections::BTreeMap;
 use std::fs;
@@ -177,8 +178,17 @@ impl GixRepo {
             cmd.arg("--name").arg(name);
             command.push_str(&format!(" --name {name}"));
         }
-        cmd.arg(url).arg(path);
-        command.push_str(&format!(" {url} {}", path.display()));
+        // Same gate as clone/remote add/set-url: block hostile schemes (`ext::`,
+        // plain `http`) and option-injection (`-...`) before building argv.
+        validate_remote_url(url)?;
+        cmd.arg("--").arg(url).arg(path);
+        // Display-only string: cmd.arg(url) above keeps the raw URL for git;
+        // never echo userinfo into the logged/surfaced command label.
+        command.push_str(&format!(
+            " {} {}",
+            redact_remote_url_userinfo(url),
+            path.display()
+        ));
         match run_git_with_output(cmd, &command) {
             Ok(output) => Ok(output),
             Err(err) => Err(cleanup_failed_submodule_add_error(

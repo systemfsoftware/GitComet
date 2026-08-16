@@ -10,6 +10,7 @@ use gitcomet_core::services::{
     CancellationToken, CommandOutput, ForcePushLease, PullMode, RemoteUrlKind, Result,
     SafePushAfterCommitContext, SafePushAfterCommitDecision, SafePushAfterCommitTarget,
 };
+use gitcomet_core::url_redact::{redact_remote_url_userinfo, validate_remote_url};
 use gix::bstr::ByteSlice as _;
 use rustc_hash::FxHashSet as HashSet;
 use std::process::Command;
@@ -909,10 +910,15 @@ impl GixRepo {
         url: &str,
     ) -> Result<CommandOutput> {
         validate_ref_like_arg(name, "remote name")?;
+        // Reject hostile `ext::`/`http` URLs before building the command.
+        validate_remote_url(url)?;
 
         let mut cmd = self.git_workdir_cmd();
         cmd.arg("remote").arg("add").arg("--").arg(name).arg(url);
-        run_git_with_output(cmd, &format!("git remote add {name} {url}"))
+        run_git_with_output(
+            cmd,
+            &format!("git remote add {name} {}", redact_remote_url_userinfo(url)),
+        )
     }
 
     pub(super) fn remove_remote_with_output_impl(&self, name: &str) -> Result<CommandOutput> {
@@ -930,6 +936,8 @@ impl GixRepo {
         kind: RemoteUrlKind,
     ) -> Result<CommandOutput> {
         validate_ref_like_arg(name, "remote name")?;
+        // Reject hostile `ext::`/`http` URLs before building the command.
+        validate_remote_url(url)?;
 
         let mut cmd = self.git_workdir_cmd();
         cmd.arg("remote").arg("set-url");
@@ -940,9 +948,10 @@ impl GixRepo {
             }
         }
         cmd.arg("--").arg(name).arg(url);
+        let redacted_url = redact_remote_url_userinfo(url);
         let label = match kind {
-            RemoteUrlKind::Fetch => format!("git remote set-url {name} {url}"),
-            RemoteUrlKind::Push => format!("git remote set-url --push {name} {url}"),
+            RemoteUrlKind::Fetch => format!("git remote set-url {name} {redacted_url}"),
+            RemoteUrlKind::Push => format!("git remote set-url --push {name} {redacted_url}"),
         };
         run_git_with_output(cmd, &label)
     }

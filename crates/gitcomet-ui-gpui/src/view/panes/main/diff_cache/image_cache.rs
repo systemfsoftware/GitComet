@@ -296,6 +296,24 @@ fn cached_image_diff_path(bytes: &[u8], extension: &str) -> Option<std::path::Pa
         .ok()?;
     file.as_file_mut().write_all(bytes).ok()?;
 
+    // Keep the pending bytes private while they sit in the shared temp dir and
+    // after `persist_noclobber` renames (preserving the mode) them into place:
+    // decoded repo images must not be readable by other local users. The
+    // noclobber rename below is already safe against symlink write-through.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = file
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+        {
+            log::warn!(
+                "image diff cache: failed to set 0600 on {}: {err}",
+                path.display()
+            );
+        }
+    }
+
     match file.persist_noclobber(&path) {
         Ok(_) => {
             maybe_cleanup_image_diff_cache_on_write();

@@ -812,6 +812,11 @@ pub enum DiffLineKind {
     Context,
 }
 
+/// Maximum size of unified diff text accepted by [`Diff::from_unified_reader`].
+/// Reading beyond this bound is rejected as invalid data so hostile or
+/// accidental oversized git output cannot force unbounded buffering.
+pub const MAX_UNIFIED_DIFF_BYTES: usize = 64 * 1024 * 1024;
+
 impl Diff {
     fn line_capacity_from_bytes(bytes: &[u8]) -> usize {
         if bytes.is_empty() {
@@ -891,10 +896,26 @@ impl Diff {
 
     pub fn from_unified_reader<R: std::io::BufRead>(
         target: DiffTarget,
-        mut reader: R,
+        reader: R,
     ) -> std::io::Result<Self> {
+        // Bound the read at the cap + 1 so a hostile diff can never force
+        // unbounded buffering; the length check below then rejects it.
+        use std::io::Read as _;
         let mut text = String::new();
-        reader.read_to_string(&mut text)?;
+        reader
+            .take(MAX_UNIFIED_DIFF_BYTES as u64 + 1)
+            .read_to_string(&mut text)?;
+        if text.len() > MAX_UNIFIED_DIFF_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unified diff is {} bytes, exceeding the {} byte limit; \
+                     refusing to parse (the diff is too large to display)",
+                    text.len(),
+                    MAX_UNIFIED_DIFF_BYTES
+                ),
+            ));
+        }
         Ok(Self::from_unified_owned(target, text))
     }
 
@@ -1095,6 +1116,35 @@ diff --git a/src/lib.rs b/src/lib.rs\r\n\
         assert_eq!(diff.lines.len(), 3);
         assert!(diff.lines[0].text.shares_storage_with(&diff.lines[1].text));
         assert!(diff.lines[1].text.shares_storage_with(&diff.lines[2].text));
+    }
+
+    #[test]
+    fn unified_reader_rejects_oversized_input_and_still_parses_small() {
+        let target = DiffTarget::WorkingTree {
+            path: PathBuf::from("README.md"),
+            area: DiffArea::Unstaged,
+        };
+
+        // One byte over the cap: must be rejected as invalid data, and the
+        // error must name the cap so it is actionable for the user.
+        let oversized = "x".repeat(MAX_UNIFIED_DIFF_BYTES + 1);
+        let err = Diff::from_unified_reader(target.clone(), Cursor::new(oversized.as_bytes()))
+            .expect_err("reader input over the cap should be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(
+            message.contains(&MAX_UNIFIED_DIFF_BYTES.to_string()),
+            "error should name the cap, got: {message}"
+        );
+
+        // A small reader still parses into the same lines as the string path.
+        let unified = "\
+@@ -1 +1 @@\n\
+-old\n\
++new\n";
+        let diff = Diff::from_unified_reader(target, Cursor::new(unified.as_bytes()))
+            .expect("small reader parse should succeed");
+        assert_eq!(diff.lines.len(), 3);
     }
 
     #[test]

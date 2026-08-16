@@ -1,3 +1,5 @@
+use gitcomet_core::fs_utils::{create_new_file, enforce_directory_is_private};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CopySource {
     CommitDetailsDiff,
@@ -125,6 +127,10 @@ fn write_copy_diagnostic_inner(
         .join("gitcomet")
         .join("crashes");
     std::fs::create_dir_all(&dir)?;
+    // Crash diagnostics can embed repository paths; keep the directory out of
+    // other local users' reach. The chmod is stat-guarded in fs_utils, so an
+    // already-private dir adds no syscall per copy.
+    enforce_directory_is_private(&dir)?;
 
     let text = format!(
         "copy_source={}\ncopy_text_bytes={text_len}\ndisplay={}\nwayland_display={}\n\
@@ -138,9 +144,9 @@ fn write_copy_diagnostic_inner(
         },
     );
     let mut file =
-        std::fs::File::create(dir.join(format!("last-operation-{}.log", std::process::id())))?;
+        create_new_file(&dir.join(format!("last-operation-{}.log", std::process::id())))?;
     use std::io::Write as _;
-    file.write_all(text.as_bytes())?;
+    file.write_all(text.as_bytes())?;…
     file.sync_data()
 }
 

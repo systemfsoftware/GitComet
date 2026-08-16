@@ -109,6 +109,12 @@ impl GixRepo {
         })
     }
 
+    fn git_diff_parse_error(err: std::io::Error) -> Error {
+        Error::new(ErrorKind::Backend(format!(
+            "failed to parse unified diff output: {err}"
+        )))
+    }
+
     pub(super) fn diff_parsed_impl(&self, target: &DiffTarget) -> Result<Diff> {
         if let Some(diff) = self.synthetic_simple_commit_path_diff(target)? {
             return Ok(diff);
@@ -120,11 +126,8 @@ impl GixRepo {
             "git diff",
             true,
             move |stdout| {
-                Diff::from_unified_reader(target, BufReader::new(stdout)).map_err(|err| {
-                    Error::new(ErrorKind::Backend(format!(
-                        "git diff produced non-UTF-8 output: {err}"
-                    )))
-                })
+                Diff::from_unified_reader(target, BufReader::new(stdout))
+                    .map_err(Self::git_diff_parse_error)
             },
         )
     }
@@ -147,11 +150,8 @@ impl GixRepo {
             true,
             cancellation,
             move |stdout| {
-                Diff::from_unified_reader(target, BufReader::new(stdout)).map_err(|err| {
-                    Error::new(ErrorKind::Backend(format!(
-                        "git diff produced non-UTF-8 output: {err}"
-                    )))
-                })
+                Diff::from_unified_reader(target, BufReader::new(stdout))
+                    .map_err(Self::git_diff_parse_error)
             },
         )
     }
