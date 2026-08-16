@@ -176,16 +176,17 @@ impl GixRepo {
                     }
                 }
 
-                // Stage the file
+                // Stage the file. Use the sanitized path: `path` is hostile
+                // (index-derived) and must never reach spawn argv.
                 let mut add = self.git_workdir_cmd();
-                add.arg("add").arg("--").arg(path);
+                add.arg("add").arg("--").arg(&conflict_path);
                 run_git_simple(add, "git add (after mergetool)")?;
 
                 Some(bytes)
             }
             MergedFileState::Missing => {
                 let mut rm = self.git_workdir_cmd();
-                rm.arg("rm").arg("--").arg(path);
+                rm.arg("rm").arg("--").arg(&conflict_path);
                 run_git_simple(rm, "git rm (after mergetool)")?;
                 None
             }

@@ -13,7 +13,7 @@ use std::path::Path;
 /// `AlreadyExists` error.
 pub fn create_new_file(path: &Path) -> std::io::Result<File> {
     match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => Ok(file),
+        Ok(file) => make_private(file),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             match std::fs::symlink_metadata(path) {
                 Ok(metadata)
@@ -30,10 +30,26 @@ pub fn create_new_file(path: &Path) -> std::io::Result<File> {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
-            OpenOptions::new().write(true).create_new(true).open(path)
+            make_private(OpenOptions::new().write(true).create_new(true).open(path)?)
         }
         Err(err) => Err(err),
     }
+}
+
+/// Restricts a freshly created diagnostic file to the owning user on unix:
+/// the O_EXCL-open above creates with umask-derived permissions, so an
+/// explicit `0o600` keeps backtraces, env values, and repo paths unreadable to
+/// other local accounts even under a permissive umask.
+#[cfg(unix)]
+fn make_private(file: File) -> std::io::Result<File> {
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn make_private(file: File) -> std::io::Result<File> {
+    Ok(file)
 }
 
 /// Removes `path` only when `symlink_metadata` reports it as a symlink, never
@@ -66,7 +82,10 @@ pub fn open_append(path: &Path) -> std::io::Result<File> {
 ///
 /// Stat-first: only issues a `chmod` when the current mode is not already
 /// `0700`, so hot paths (a runtime-error log written on every `log::error!`)
-/// do not pay a redundant syscall per record.
+/// do not pay a redundant syscall per record. Failures are returned, not
+/// hidden; callers that must keep reporting (crash logs) treat this as
+/// best-effort and continue, because per-file `0600` (see `create_new_file`)
+/// still protects contents even when the directory cannot be tightened.
 pub fn enforce_directory_is_private(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

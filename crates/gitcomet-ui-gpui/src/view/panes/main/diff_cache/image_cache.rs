@@ -303,9 +303,15 @@ fn cached_image_diff_path(bytes: &[u8], extension: &str) -> Option<std::path::Pa
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = file
+        if let Err(err) = file
             .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600));
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+        {
+            log::warn!(
+                "image diff cache: failed to set 0600 on {}: {err}",
+                path.display()
+            );
+        }
     }
 
     match file.persist_noclobber(&path) {

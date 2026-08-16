@@ -254,7 +254,7 @@ fn write_runtime_error_log_in_dir(
     backtrace: &str,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    enforce_directory_is_private(dir)?;
+    let _ = enforce_directory_is_private(dir); // best-effort: per-file 0600 protects contents; a dir chmod failure must not disable crash reporting
     let path = runtime_error_path(dir);
     let has_existing_log = std::fs::metadata(&path)
         .map(|metadata| metadata.len() > 0)
@@ -305,7 +305,7 @@ pub fn begin_session() -> std::io::Result<()> {
 
 fn begin_session_in_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    enforce_directory_is_private(dir)?;
+    let _ = enforce_directory_is_private(dir); // best-effort: per-file 0600 protects contents; a dir chmod failure must not disable crash reporting
     remove_file_if_exists(&last_operation_path(dir))?;
     remove_file_if_exists(&runtime_error_path(dir))?;
 
@@ -387,7 +387,7 @@ fn record_session_failure_in_dir_with_diagnostics(
     backtrace: Option<&str>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    enforce_directory_is_private(dir)?;
+    let _ = enforce_directory_is_private(dir); // best-effort: per-file 0600 protects contents; a dir chmod failure must not disable crash reporting
     let mut file = open_append(&session_marker_path(dir))?;
     writeln!(file, "failure_kind=returned-error")?;
     writeln!(file, "failure_context={}", single_line_text(context))?;
@@ -636,7 +636,7 @@ fn append_report_log(destination: &mut String, report_log: &str) {
 
 fn write_startup_report_snapshot(dir: &Path, report_log: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    enforce_directory_is_private(dir)?;
+    let _ = enforce_directory_is_private(dir); // best-effort: per-file 0600 protects contents; a dir chmod failure must not disable crash reporting
     let report_path = startup_report_path(dir);
     let temporary_path = dir.join(format!(
         ".{STARTUP_REPORT_FILE}-{}-{}.tmp",

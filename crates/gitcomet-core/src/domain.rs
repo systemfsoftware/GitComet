@@ -905,7 +905,7 @@ impl Diff {
         reader
             .take(MAX_UNIFIED_DIFF_BYTES as u64 + 1)
             .read_to_string(&mut text)?;
-        if text.len() >= MAX_UNIFIED_DIFF_BYTES {
+        if text.len() > MAX_UNIFIED_DIFF_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
