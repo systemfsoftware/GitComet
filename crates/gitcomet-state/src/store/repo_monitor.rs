@@ -1,5 +1,5 @@
 use crate::model::RepoId;
-use crate::msg::{Msg, RepoExternalChange, RepoWatchDegradedReason};
+use crate::msg::{Msg, RepoExternalChange, RepoWatchDegradedReason, WatcherExcludeLoadStatus};
 use gix::index::entry::Mode as GitIndexMode;
 use notify::event::{AccessKind, AccessMode, EventKindMask};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
@@ -771,11 +771,18 @@ fn build_workdir_watcher(
 
 /// The user-facing degraded-watch reason for an outcome, or `None` when watching is healthy
 /// (fully watched, or the root watch failed and the watcher is being discarded).
-fn watch_degraded_reason(outcome: WatchSetupOutcome) -> Option<RepoWatchDegradedReason> {
+fn watch_degraded_reason(
+    outcome: WatchSetupOutcome,
+    load_status: WatcherExcludeLoadStatus,
+) -> Option<RepoWatchDegradedReason> {
     match outcome {
         #[cfg(any(target_os = "linux", test))]
-        WatchSetupOutcome::WorktreeSubdirsSkipped { dir_count } => {
-            Some(RepoWatchDegradedReason::TooManyFolders { dir_count })
+        WatchSetupOutcome::WorktreeSubdirsSkipped { dir_count, capped } => {
+            Some(RepoWatchDegradedReason::TooManyFolders {
+                dir_count,
+                capped,
+                load_status,
+            })
         }
         WatchSetupOutcome::Watching { failed_dirs } if failed_dirs > 0 => {
             Some(RepoWatchDegradedReason::WatchLimitReached {
@@ -792,8 +799,9 @@ fn watch_degraded_reason(outcome: WatchSetupOutcome) -> Option<RepoWatchDegraded
 fn watch_degraded_transition(
     previously_degraded: &mut bool,
     outcome: WatchSetupOutcome,
+    load_status: WatcherExcludeLoadStatus,
 ) -> Option<RepoWatchDegradedReason> {
-    let reason = watch_degraded_reason(outcome);
+    let reason = watch_degraded_reason(outcome, load_status);
     let should_warn = reason.is_some() && !*previously_degraded;
     *previously_degraded = reason.is_some();
     if should_warn { reason } else { None }
@@ -806,8 +814,9 @@ fn note_watch_outcome(
     repo_id: RepoId,
     previously_degraded: &mut bool,
     outcome: WatchSetupOutcome,
+    load_status: WatcherExcludeLoadStatus,
 ) {
-    if let Some(reason) = watch_degraded_transition(previously_degraded, outcome) {
+    if let Some(reason) = watch_degraded_transition(previously_degraded, outcome, load_status) {
         msg_tx.send_repo_monitor_or_log(
             Msg::RepoWatchDegraded { repo_id, reason },
             "repo monitor watch degraded",
@@ -940,7 +949,13 @@ fn repo_monitor_thread(
     // repository correct.
     let mut watch_degraded = false;
     let mut last_recovery_attempt: Option<Instant> = None;
-    note_watch_outcome(&msg_tx, repo_id, &mut watch_degraded, watch_outcome);
+    note_watch_outcome(
+        &msg_tx,
+        repo_id,
+        &mut watch_degraded,
+        watch_outcome,
+        watcher_excludes.load_status(),
+    );
 
     let debounce = Duration::from_millis(250);
     let max_delay = Duration::from_secs(2);
@@ -1115,7 +1130,13 @@ fn repo_monitor_thread(
                     ) {
                         watcher = new_watcher;
                         watch_outcome = new_outcome;
-                        note_watch_outcome(&msg_tx, repo_id, &mut watch_degraded, watch_outcome);
+                        note_watch_outcome(
+                            &msg_tx,
+                            repo_id,
+                            &mut watch_degraded,
+                            watch_outcome,
+                            watcher_excludes.load_status(),
+                        );
                         rules_rebuild_pending = false;
                     }
                 }
@@ -1144,7 +1165,13 @@ fn repo_monitor_thread(
                     ) {
                         watcher = new_watcher;
                         watch_outcome = new_outcome;
-                        note_watch_outcome(&msg_tx, repo_id, &mut watch_degraded, watch_outcome);
+                        note_watch_outcome(
+                            &msg_tx,
+                            repo_id,
+                            &mut watch_degraded,
+                            watch_outcome,
+                            watcher_excludes.load_status(),
+                        );
                     }
                 }
             }
@@ -1339,7 +1366,7 @@ enum WatchSetupOutcome {
     /// root); the source tree is left to the `.git` watch + focus-triggered full refresh. Carries
     /// the subdirectory count for the user-facing warning.
     #[cfg(any(target_os = "linux", test))]
-    WorktreeSubdirsSkipped { dir_count: usize },
+    WorktreeSubdirsSkipped { dir_count: usize, capped: bool },
     /// The workdir root watch failed; the watcher is unusable.
     RootWatchFailed,
 }
@@ -1421,26 +1448,34 @@ fn setup_workdir_watch_with_limit(
         max_dirs,
     );
     let subdir_count = dirs.len().saturating_sub(1);
+    let capped = dirs.len() > max_dirs.saturating_add(1);
 
     if subdir_count > max_dirs {
         // Too many folders to watch within the kernel limit: do not watch any source folders. The
         // `.git` watch keeps git operations live, and focus reload re-reads the whole worktree.
         repo_load_trace::trace!(
-            "monitor_setup_watches_skipped repo_id={:?} workdir={} subdirs={} max={}",
+            "monitor_setup_watches_skipped repo_id={:?} workdir={} subdirs={} max={} capped={} exclude_status={:?} exclude_rules={}",
             repo_id,
             workdir.display(),
             subdir_count,
-            max_dirs
+            max_dirs,
+            capped,
+            watcher_excludes.load_status(),
+            watcher_excludes.parsed_rule_count(),
         );
         eprintln!(
             "gitcomet-state: repo monitor is not watching the {subdir_count} worktree folders of \
              repo_id={repo_id:?} (workdir={}) because that exceeds the watch budget ({max_dirs}); \
              live file watching is disabled and changes refresh when the window regains focus. Add \
-             build/output dirs to .gitignore or raise fs.inotify.max_user_watches to re-enable.",
+             build/output dirs to .gitignore or to .vscode/settings.json files.watcherExclude, or \
+             raise fs.inotify.max_user_watches to re-enable. exclude_status={:?} exclude_rules={}",
             workdir.display(),
+            watcher_excludes.load_status(),
+            watcher_excludes.parsed_rule_count(),
         );
         return WatchSetupOutcome::WorktreeSubdirsSkipped {
             dir_count: subdir_count,
+            capped,
         };
     }
 
@@ -2848,44 +2883,55 @@ mod tests {
     #[test]
     fn watch_degraded_transition_fires_once_per_degraded_episode() {
         let mut degraded = false;
-        // Entering the skipped state warns, carrying the folder count.
+        let parsed = WatcherExcludeLoadStatus::Parsed;
         assert_eq!(
             watch_degraded_transition(
                 &mut degraded,
-                WatchSetupOutcome::WorktreeSubdirsSkipped { dir_count: 9000 }
+                WatchSetupOutcome::WorktreeSubdirsSkipped {
+                    dir_count: 9000,
+                    capped: false,
+                },
+                parsed,
             ),
-            Some(RepoWatchDegradedReason::TooManyFolders { dir_count: 9000 })
+            Some(RepoWatchDegradedReason::TooManyFolders {
+                dir_count: 9000,
+                capped: false,
+                load_status: parsed,
+            })
         );
-        // Staying degraded (e.g. a .gitignore rebuild that is still over budget) does not re-warn.
         assert_eq!(
             watch_degraded_transition(
                 &mut degraded,
-                WatchSetupOutcome::WorktreeSubdirsSkipped { dir_count: 9001 }
+                WatchSetupOutcome::WorktreeSubdirsSkipped {
+                    dir_count: 9001,
+                    capped: false,
+                },
+                parsed,
             ),
             None
         );
-        // Recovering to full watching clears the flag without warning.
         assert_eq!(
             watch_degraded_transition(
                 &mut degraded,
-                WatchSetupOutcome::Watching { failed_dirs: 0 }
+                WatchSetupOutcome::Watching { failed_dirs: 0 },
+                parsed,
             ),
             None
         );
         assert!(!degraded);
-        // A partial watch failure is also a degraded transition and warns with the unwatched count.
         assert_eq!(
             watch_degraded_transition(
                 &mut degraded,
-                WatchSetupOutcome::Watching { failed_dirs: 7 }
+                WatchSetupOutcome::Watching { failed_dirs: 7 },
+                parsed,
             ),
             Some(RepoWatchDegradedReason::WatchLimitReached { unwatched_dirs: 7 })
         );
-        // Still partially failing on a rebuild does not re-warn.
         assert_eq!(
             watch_degraded_transition(
                 &mut degraded,
-                WatchSetupOutcome::Watching { failed_dirs: 3 }
+                WatchSetupOutcome::Watching { failed_dirs: 3 },
+                parsed,
             ),
             None
         );
@@ -3530,6 +3576,8 @@ mod tests {
         let git_dir = resolve_git_dir(&workdir);
         let mut gitignore = GitignoreRules::load(&workdir);
         let mut excludes = WatcherExcludes::load(&workdir, true);
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Parsed);
+        assert_eq!(excludes.parsed_rule_count(), 1);
 
         let dirs = collect_watchable_dirs(
             &workdir,
@@ -3551,8 +3599,8 @@ mod tests {
             "non-excluded dirs must stay watched"
         );
 
-        // Disabled rule set: everything is watched again (T2.1/T2.6 parity).
         let mut disabled = WatcherExcludes::load(&workdir, false);
+        assert_eq!(disabled.load_status(), WatcherExcludeLoadStatus::Disabled);
         let dirs = collect_watchable_dirs(
             &workdir,
             &workdir,
@@ -3562,6 +3610,51 @@ mod tests {
         );
         assert!(dirs.contains(&workdir.join("node_modules")));
         assert!(dirs.contains(&workdir.join("node_modules").join("pkg")));
+    }
+
+    #[test]
+    fn jsonc_repos_exclude_drops_tracked_vendor_tree() {
+        let dir = unique_temp_dir("gitcomet-monitor-jsonc-repos");
+        let workdir = dir.path().join("repo");
+        init_repo_for_ignore_tests(&workdir);
+        fs::create_dir_all(workdir.join("repos").join("pkg")).expect("create repos");
+        fs::write(workdir.join("repos").join("tracked.txt"), "x").expect("write tracked");
+        fs::create_dir_all(workdir.join("src")).expect("create src");
+        run_git(&workdir, &["add", "repos/tracked.txt"]);
+        run_git(&workdir, &["commit", "-m", "track vendor"]);
+        fs::create_dir_all(workdir.join(".vscode")).expect("create .vscode");
+        fs::write(
+            WatcherExcludes::config_path(&workdir),
+            r#"{
+                // IDE excludes
+                "files.watcherExclude": {
+                    "repos/": true,
+                },
+            }"#,
+        )
+        .expect("write settings.json");
+        let git_dir = resolve_git_dir(&workdir);
+        let mut gitignore = GitignoreRules::load(&workdir);
+        let mut excludes = WatcherExcludes::load(&workdir, true);
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Parsed);
+        assert_eq!(excludes.parsed_rule_count(), 1);
+
+        let dirs = collect_watchable_dirs(
+            &workdir,
+            &workdir,
+            git_dir.as_deref(),
+            &mut gitignore,
+            &mut excludes,
+        );
+        assert!(
+            dirs.contains(&workdir.join("src")),
+            "sibling source dir must stay watchable"
+        );
+        assert!(
+            !dirs.contains(&workdir.join("repos")),
+            "JSONC-excluded tracked vendor dir must drop from the census"
+        );
+        assert!(!dirs.contains(&workdir.join("repos").join("pkg")));
     }
 
     #[test]

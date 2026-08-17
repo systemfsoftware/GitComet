@@ -22,8 +22,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::repo_load_trace;
+use crate::msg::WatcherExcludeLoadStatus;
 
+use super::repo_load_trace;
 /// Directory and file of the VS Code settings inside the worktree.
 const VSCODE_SETTINGS_DIR: &str = ".vscode";
 const VSCODE_SETTINGS_FILE: &str = "settings.json";
@@ -190,10 +191,23 @@ fn pattern_excludes(
 /// The watcher-exclude rule set for one repository worktree.
 ///
 /// Immutable after load; the monitor reloads it when the config file changes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct WatcherExcludes {
     enabled: bool,
     patterns: Vec<ExcludePattern>,
+    load_status: WatcherExcludeLoadStatus,
+    parsed_rule_count: usize,
+}
+
+impl Default for WatcherExcludes {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            patterns: Vec::new(),
+            load_status: WatcherExcludeLoadStatus::Disabled,
+            parsed_rule_count: 0,
+        }
+    }
 }
 
 impl WatcherExcludes {
@@ -202,12 +216,17 @@ impl WatcherExcludes {
     /// `enabled` gates the whole mechanism: a disabled rule set is empty and
     /// never reads the config file.
     pub(crate) fn load(workdir: &Path, enabled: bool) -> Self {
-        let patterns = if enabled {
-            parse_vscode_watcher_exclude(workdir).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        Self { enabled, patterns }
+        if !enabled {
+            return Self::default();
+        }
+        let (patterns, load_status, parsed_rule_count) =
+            parse_vscode_watcher_exclude_with_status(workdir);
+        Self {
+            enabled: true,
+            patterns,
+            load_status,
+            parsed_rule_count,
+        }
     }
 
     /// Path of the config file this rule set reads from.
@@ -219,6 +238,14 @@ impl WatcherExcludes {
     /// enabled); used to re-load with the same setting after a config change.
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(crate) fn load_status(&self) -> WatcherExcludeLoadStatus {
+        self.load_status
+    }
+
+    pub(crate) fn parsed_rule_count(&self) -> usize {
+        self.parsed_rule_count
     }
 
     /// Returns `true` when `rel` (worktree-relative) falls under an exclude
@@ -247,10 +274,12 @@ impl WatcherExcludes {
 
 /// Parses `files.watcherExclude` from `<workdir>/.vscode/settings.json`.
 ///
-/// Returns `None` on any structural problem (missing file, invalid JSON, wrong
-/// types) — the caller treats that as an empty rule set; diagnosability comes
-/// from the trace lines (plan T1.1).
-fn parse_vscode_watcher_exclude(workdir: &Path) -> Option<Vec<ExcludePattern>> {
+/// Missing / unreadable / unparseable files yield an empty rule set plus the
+/// matching [`WatcherExcludeLoadStatus`]. Diagnosability comes from the trace
+/// lines (origin plan T1.1).
+fn parse_vscode_watcher_exclude_with_status(
+    workdir: &Path,
+) -> (Vec<ExcludePattern>, WatcherExcludeLoadStatus, usize) {
     let path = WatcherExcludes::config_path(workdir);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -259,26 +288,43 @@ fn parse_vscode_watcher_exclude(workdir: &Path) -> Option<Vec<ExcludePattern>> {
                 "watcher_excludes: {} not found — treating as empty",
                 path.display()
             );
-            return Some(Vec::new());
+            return (Vec::new(), WatcherExcludeLoadStatus::Missing, 0);
         }
         Err(error) => {
             repo_load_trace::trace!(
                 "watcher_excludes: could not read {}: {error} — treating as empty",
                 path.display()
             );
-            return Some(Vec::new());
+            return (Vec::new(), WatcherExcludeLoadStatus::Unreadable, 0);
         }
     };
-    let value: serde_json::Value = match serde_json::from_str(&text) {
+
+    let parse_options = jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+    };
+    let value: serde_json::Value = match jsonc_parser::parse_to_serde_value(&text, &parse_options) {
         Ok(value) => value,
         Err(error) => {
             repo_load_trace::trace!(
                 "watcher_excludes: could not parse {}: {error} — treating as empty",
                 path.display()
             );
-            return Some(Vec::new());
+            return (Vec::new(), WatcherExcludeLoadStatus::Unreadable, 0);
         }
     };
+    if !value.is_object() {
+        repo_load_trace::trace!(
+            "watcher_excludes: {} is not a JSON object — treating as empty",
+            path.display()
+        );
+        return (Vec::new(), WatcherExcludeLoadStatus::Unreadable, 0);
+    }
     let Some(excludes) = value
         .get("files.watcherExclude")
         .and_then(serde_json::Value::as_object)
@@ -287,7 +333,7 @@ fn parse_vscode_watcher_exclude(workdir: &Path) -> Option<Vec<ExcludePattern>> {
             "watcher_excludes: {} has no `files.watcherExclude` object — treating as empty",
             path.display()
         );
-        return Some(Vec::new());
+        return (Vec::new(), WatcherExcludeLoadStatus::Parsed, 0);
     };
 
     let mut patterns = Vec::new();
@@ -333,7 +379,12 @@ fn parse_vscode_watcher_exclude(workdir: &Path) -> Option<Vec<ExcludePattern>> {
             dir_only,
         });
     }
-    Some(patterns)
+    let parsed_rule_count = patterns.len();
+    (
+        patterns,
+        WatcherExcludeLoadStatus::Parsed,
+        parsed_rule_count,
+    )
 }
 
 /// Whether the original pattern contains a slash (after stripping the trailing
@@ -391,14 +442,16 @@ mod tests {
         let excludes = WatcherExcludes::load(dir.path(), true);
         assert!(!excludes.is_excluded(rel("src"), Some(true)));
         assert!(!excludes.is_excluded(rel("node_modules"), Some(true)));
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Missing);
+        assert_eq!(excludes.parsed_rule_count(), 0);
     }
-
     #[test]
     fn empty_settings_yield_empty_rules() {
         let dir = temp_workdir();
         write_settings(dir.path(), "");
         let excludes = WatcherExcludes::load(dir.path(), true);
         assert!(!excludes.is_excluded(rel("node_modules"), Some(true)));
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Unreadable);
     }
 
     #[test]
@@ -407,6 +460,63 @@ mod tests {
         write_settings(dir.path(), "{ not json");
         let excludes = WatcherExcludes::load(dir.path(), true);
         assert!(!excludes.is_excluded(rel("node_modules"), Some(true)));
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Unreadable);
+        assert_eq!(excludes.parsed_rule_count(), 0);
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_comma_load_repos_exclude() {
+        let dir = temp_workdir();
+        write_settings(
+            dir.path(),
+            r#"{
+                // workspace watcher excludes
+                "files.watcherExclude": {
+                    "repos/": true, /* vendor trees */
+                },
+            }"#,
+        );
+        let excludes = WatcherExcludes::load(dir.path(), true);
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Parsed);
+        assert_eq!(excludes.parsed_rule_count(), 1);
+        assert!(excludes.is_excluded(rel("repos"), Some(true)));
+        assert!(excludes.is_excluded(rel("repos/x"), Some(true)));
+        assert!(!excludes.is_excluded(rel("src"), Some(true)));
+    }
+    #[test]
+    fn jsonc_string_containing_slashes_is_not_a_comment() {
+        let dir = temp_workdir();
+        write_settings(
+            dir.path(),
+            r#"{
+                "homepage": "http://example.com//docs",
+                "files.watcherExclude": {
+                    "repos/": true
+                }
+            }"#,
+        );
+        let excludes = WatcherExcludes::load(dir.path(), true);
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Parsed);
+        assert_eq!(excludes.parsed_rule_count(), 1);
+        assert!(excludes.is_excluded(rel("repos"), Some(true)));
+    }
+
+    #[test]
+    fn parsed_file_without_watcher_exclude_is_empty_parsed() {
+        let dir = temp_workdir();
+        write_settings(dir.path(), r#"{"editor.tabSize": 4}"#);
+        let excludes = WatcherExcludes::load(dir.path(), true);
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Parsed);
+        assert_eq!(excludes.parsed_rule_count(), 0);
+        assert!(!excludes.is_excluded(rel("repos"), Some(true)));
+    }
+
+    #[test]
+    fn default_rule_set_is_disabled() {
+        let excludes = WatcherExcludes::default();
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Disabled);
+        assert!(!excludes.enabled());
+        assert!(!excludes.is_excluded(rel("repos"), Some(true)));
     }
 
     #[test]
@@ -415,6 +525,8 @@ mod tests {
         write_settings(dir.path(), r#"{"files.watcherExclude": 42}"#);
         let excludes = WatcherExcludes::load(dir.path(), true);
         assert!(!excludes.is_excluded(rel("node_modules"), Some(true)));
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Parsed);
+        assert_eq!(excludes.parsed_rule_count(), 0);
     }
 
     #[test]
@@ -428,6 +540,8 @@ mod tests {
         assert!(excludes.is_excluded(rel("node_modules"), Some(true)));
         assert!(!excludes.is_excluded(rel("dist"), Some(true)));
         assert!(!excludes.is_excluded(rel("vendor"), Some(true)));
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Parsed);
+        assert_eq!(excludes.parsed_rule_count(), 1);
     }
 
     #[test]

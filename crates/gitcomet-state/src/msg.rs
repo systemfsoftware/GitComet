@@ -11,7 +11,7 @@ pub use effect::Effect;
 pub use message::{
     CommitSelectMode, ConflictAutosolveMode, ConflictAutosolveStats, ConflictBulkChoice,
     ConflictBulkScope, ConflictRegionChoice, ConflictRegionResolutionUpdate, InternalMsg, Msg,
-    RepoActionKind, RepoWatchDegradedReason,
+    RepoActionKind, RepoWatchDegradedReason, WatcherExcludeLoadStatus,
 };
 pub use repo_command_kind::RepoCommandKind;
 pub use repo_external_change::RepoExternalChange;
