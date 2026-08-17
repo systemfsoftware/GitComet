@@ -294,6 +294,10 @@ fn parse_vscode_watcher_exclude_with_status(
             return (Vec::new(), WatcherExcludeLoadStatus::Unreadable);
         }
     };
+    // jsonc-parser does not treat U+FEFF as whitespace. A UTF-8 BOM is a
+    // leading format character, so it must be stripped or the file is
+    // Unreadable and every exclude is lost.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
 
     let parse_options = jsonc_parser::ParseOptions {
         allow_comments: true,
@@ -304,7 +308,7 @@ fn parse_vscode_watcher_exclude_with_status(
         allow_hexadecimal_numbers: false,
         allow_unary_plus_numbers: false,
     };
-    let value: serde_json::Value = match jsonc_parser::parse_to_serde_value(&text, &parse_options) {
+    let value: serde_json::Value = match jsonc_parser::parse_to_serde_value(text, &parse_options) {
         Ok(value) => value,
         Err(error) => {
             repo_load_trace::trace!(
@@ -469,6 +473,20 @@ mod tests {
         assert!(excludes.is_excluded(rel("repos/x"), Some(true)));
         assert!(!excludes.is_excluded(rel("src"), Some(true)));
     }
+
+    #[test]
+    fn utf8_bom_prefixed_jsonc_still_loads_excludes() {
+        let dir = temp_workdir();
+        write_settings(
+            dir.path(),
+            "\u{feff}{\n                // workspace watcher excludes\n                \"files.watcherExclude\": {\n                    \"repos/\": true,\n                },\n            }",
+        );
+        let excludes = WatcherExcludes::load(dir.path(), true);
+        assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Parsed);
+        assert_eq!(excludes.parsed_rule_count(), 1);
+        assert!(excludes.is_excluded(rel("repos"), Some(true)));
+    }
+
 
     #[test]
     fn jsonc_string_containing_slashes_is_not_a_comment() {
