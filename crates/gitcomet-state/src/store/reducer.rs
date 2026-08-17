@@ -900,12 +900,31 @@ fn reduce_inner(
         }
         Msg::RepoWatchDegraded { repo_id: _, reason } => {
             let message = match reason {
-                crate::msg::RepoWatchDegradedReason::TooManyFolders { dir_count } => format!(
-                    "This repository has {dir_count} folders — live file watching is disabled to \
-                     stay within system limits. Changes refresh when the window regains focus. Add \
-                     build/output dirs to .gitignore or raise fs.inotify.max_user_watches to \
-                     re-enable."
-                ),
+                crate::msg::RepoWatchDegradedReason::TooManyFolders {
+                    dir_count,
+                    capped,
+                    load_status,
+                } => {
+                    let count = if capped {
+                        format!("more than {}", dir_count.saturating_sub(1))
+                    } else {
+                        dir_count.to_string()
+                    };
+                    let parse_note = match load_status {
+                        crate::msg::WatcherExcludeLoadStatus::Unreadable => {
+                            " .vscode/settings.json could not be parsed, so files.watcherExclude was not applied."
+                        }
+                        crate::msg::WatcherExcludeLoadStatus::Disabled
+                        | crate::msg::WatcherExcludeLoadStatus::Missing
+                        | crate::msg::WatcherExcludeLoadStatus::Parsed => "",
+                    };
+                    format!(
+                        "This repository has {count} folders — live file watching is disabled to \
+                     stay within system limits. Changes refresh when the window regains focus.{parse_note} \
+                     Add build/output dirs to .gitignore or to .vscode/settings.json files.watcherExclude, \
+                     or raise fs.inotify.max_user_watches to re-enable."
+                    )
+                }
                 crate::msg::RepoWatchDegradedReason::WatchLimitReached { unwatched_dirs } => {
                     format!(
                         "Live file watching is partial: {unwatched_dirs} folders could not be watched \
@@ -2398,7 +2417,11 @@ mod nav_history_tests {
             &mut state,
             Msg::RepoWatchDegraded {
                 repo_id: RepoId(1),
-                reason: crate::msg::RepoWatchDegradedReason::TooManyFolders { dir_count: 9000 },
+                reason: crate::msg::RepoWatchDegradedReason::TooManyFolders {
+                    dir_count: 9000,
+                    capped: false,
+                    load_status: crate::msg::WatcherExcludeLoadStatus::Parsed,
+                },
             },
         );
         assert_eq!(state.notifications.len(), 1);
@@ -2409,8 +2432,35 @@ mod nav_history_tests {
             "warning should mention the folder count: {}",
             note.message
         );
+        assert!(
+            note.message.contains("files.watcherExclude"),
+            "warning should name the IDE exclude remedy: {}",
+            note.message
+        );
 
-        // A partial watch failure surfaces a (distinct) warning too — not just the stderr log.
+        dispatch(
+            &mut state,
+            Msg::RepoWatchDegraded {
+                repo_id: RepoId(1),
+                reason: crate::msg::RepoWatchDegradedReason::TooManyFolders {
+                    dir_count: 4097,
+                    capped: true,
+                    load_status: crate::msg::WatcherExcludeLoadStatus::Unreadable,
+                },
+            },
+        );
+        let note = &state.notifications[1];
+        assert!(
+            note.message.contains("more than 4096"),
+            "capped warning must not treat the probe as an exact census: {}",
+            note.message
+        );
+        assert!(
+            note.message.contains("could not be parsed"),
+            "unreadable settings must be named: {}",
+            note.message
+        );
+
         dispatch(
             &mut state,
             Msg::RepoWatchDegraded {
@@ -2420,8 +2470,8 @@ mod nav_history_tests {
                 },
             },
         );
-        assert_eq!(state.notifications.len(), 2);
-        let note = &state.notifications[1];
+        assert_eq!(state.notifications.len(), 3);
+        let note = &state.notifications[2];
         assert_eq!(note.kind, crate::model::AppNotificationKind::Warning);
         assert!(
             note.message.contains("42"),

@@ -128,12 +128,32 @@ impl ConflictAutosolveStats {
     }
 }
 
+/// How `<workdir>/.vscode/settings.json` `files.watcherExclude` loaded for the
+/// active monitor. `Copy` so it can ride on [`RepoWatchDegradedReason`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WatcherExcludeLoadStatus {
+    /// The Respect-IDE-excludes setting is off; the file was not read.
+    #[default]
+    Disabled,
+    /// The settings file is absent.
+    Missing,
+    /// The file existed but could not be read or parsed as JSONC.
+    Unreadable,
+    /// The file parsed. True-entry count lives on the rule set, not here.
+    Parsed,
+}
+
 /// Why the file-system watcher is in a degraded state (carried by [`Msg::RepoWatchDegraded`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepoWatchDegradedReason {
     /// The worktree has more non-ignored folders than the watch budget, so its source folders are
-    /// not watched live at all. Carries the folder count.
-    TooManyFolders { dir_count: usize },
+    /// not watched live at all. `dir_count` is the probe length; `capped` means the walk stopped
+    /// early so the count is not an exact census.
+    TooManyFolders {
+        dir_count: usize,
+        capped: bool,
+        load_status: WatcherExcludeLoadStatus,
+    },
     /// Some per-directory watches could not be added (the kernel inotify limit was reached), so part
     /// of the worktree is not watched live. Carries the number of folders left unwatched.
     WatchLimitReached { unwatched_dirs: usize },
