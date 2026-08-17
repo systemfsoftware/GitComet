@@ -914,7 +914,9 @@ fn reduce_inner(
                         crate::msg::WatcherExcludeLoadStatus::Unreadable => {
                             " .vscode/settings.json could not be parsed, so files.watcherExclude was not applied."
                         }
-                        _ => "",
+                        crate::msg::WatcherExcludeLoadStatus::Disabled
+                        | crate::msg::WatcherExcludeLoadStatus::Missing
+                        | crate::msg::WatcherExcludeLoadStatus::Parsed => "",
                     };
                     format!(
                         "This repository has {count} folders — live file watching is disabled to \

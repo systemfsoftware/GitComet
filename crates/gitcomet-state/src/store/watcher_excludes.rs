@@ -196,7 +196,6 @@ pub(crate) struct WatcherExcludes {
     enabled: bool,
     patterns: Vec<ExcludePattern>,
     load_status: WatcherExcludeLoadStatus,
-    parsed_rule_count: usize,
 }
 
 impl Default for WatcherExcludes {
@@ -205,7 +204,6 @@ impl Default for WatcherExcludes {
             enabled: false,
             patterns: Vec::new(),
             load_status: WatcherExcludeLoadStatus::Disabled,
-            parsed_rule_count: 0,
         }
     }
 }
@@ -219,13 +217,11 @@ impl WatcherExcludes {
         if !enabled {
             return Self::default();
         }
-        let (patterns, load_status, parsed_rule_count) =
-            parse_vscode_watcher_exclude_with_status(workdir);
+        let (patterns, load_status) = parse_vscode_watcher_exclude_with_status(workdir);
         Self {
             enabled: true,
             patterns,
             load_status,
-            parsed_rule_count,
         }
     }
 
@@ -245,7 +241,7 @@ impl WatcherExcludes {
     }
 
     pub(crate) fn parsed_rule_count(&self) -> usize {
-        self.parsed_rule_count
+        self.patterns.len()
     }
 
     /// Returns `true` when `rel` (worktree-relative) falls under an exclude
@@ -279,7 +275,7 @@ impl WatcherExcludes {
 /// lines (origin plan T1.1).
 fn parse_vscode_watcher_exclude_with_status(
     workdir: &Path,
-) -> (Vec<ExcludePattern>, WatcherExcludeLoadStatus, usize) {
+) -> (Vec<ExcludePattern>, WatcherExcludeLoadStatus) {
     let path = WatcherExcludes::config_path(workdir);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -288,14 +284,14 @@ fn parse_vscode_watcher_exclude_with_status(
                 "watcher_excludes: {} not found — treating as empty",
                 path.display()
             );
-            return (Vec::new(), WatcherExcludeLoadStatus::Missing, 0);
+            return (Vec::new(), WatcherExcludeLoadStatus::Missing);
         }
         Err(error) => {
             repo_load_trace::trace!(
                 "watcher_excludes: could not read {}: {error} — treating as empty",
                 path.display()
             );
-            return (Vec::new(), WatcherExcludeLoadStatus::Unreadable, 0);
+            return (Vec::new(), WatcherExcludeLoadStatus::Unreadable);
         }
     };
 
@@ -315,7 +311,7 @@ fn parse_vscode_watcher_exclude_with_status(
                 "watcher_excludes: could not parse {}: {error} — treating as empty",
                 path.display()
             );
-            return (Vec::new(), WatcherExcludeLoadStatus::Unreadable, 0);
+            return (Vec::new(), WatcherExcludeLoadStatus::Unreadable);
         }
     };
     if !value.is_object() {
@@ -323,7 +319,7 @@ fn parse_vscode_watcher_exclude_with_status(
             "watcher_excludes: {} is not a JSON object — treating as empty",
             path.display()
         );
-        return (Vec::new(), WatcherExcludeLoadStatus::Unreadable, 0);
+        return (Vec::new(), WatcherExcludeLoadStatus::Unreadable);
     }
     let Some(excludes) = value
         .get("files.watcherExclude")
@@ -333,18 +329,14 @@ fn parse_vscode_watcher_exclude_with_status(
             "watcher_excludes: {} has no `files.watcherExclude` object — treating as empty",
             path.display()
         );
-        return (Vec::new(), WatcherExcludeLoadStatus::Parsed, 0);
+        return (Vec::new(), WatcherExcludeLoadStatus::Parsed);
     };
 
     let mut patterns = Vec::new();
     for (glob, include) in excludes {
         if include.as_bool() != Some(true) {
-            // `false` is an explicit non-exclude; non-booleans are ignored.
             continue;
         }
-        // A trailing `/` marks a directory-only pattern; strip it first. The
-        // anchoring decision uses the ORIGINAL glob: a trailing slash implies a
-        // slash, so an anchored (root-relative) pattern.
         let (glob, dir_only) = match glob.strip_suffix('/') {
             Some(trimmed) => (trimmed, true),
             None => (glob.as_str(), false),
@@ -364,8 +356,6 @@ fn parse_vscode_watcher_exclude_with_status(
                 .iter()
                 .all(|segment| segment.as_ref().is_some_and(|c| c.text.is_empty()))
         {
-            // `"/"` (or a run of slashes) compiles to empty literal
-            // segments, which never match a real path component.
             repo_load_trace::trace!(
                 "watcher_excludes: pattern {:?} in {} is empty and is ignored",
                 glob,
@@ -379,12 +369,7 @@ fn parse_vscode_watcher_exclude_with_status(
             dir_only,
         });
     }
-    let parsed_rule_count = patterns.len();
-    (
-        patterns,
-        WatcherExcludeLoadStatus::Parsed,
-        parsed_rule_count,
-    )
+    (patterns, WatcherExcludeLoadStatus::Parsed)
 }
 
 /// Whether the original pattern contains a slash (after stripping the trailing
@@ -445,6 +430,7 @@ mod tests {
         assert_eq!(excludes.load_status(), WatcherExcludeLoadStatus::Missing);
         assert_eq!(excludes.parsed_rule_count(), 0);
     }
+
     #[test]
     fn empty_settings_yield_empty_rules() {
         let dir = temp_workdir();
@@ -483,6 +469,7 @@ mod tests {
         assert!(excludes.is_excluded(rel("repos/x"), Some(true)));
         assert!(!excludes.is_excluded(rel("src"), Some(true)));
     }
+
     #[test]
     fn jsonc_string_containing_slashes_is_not_a_comment() {
         let dir = temp_workdir();

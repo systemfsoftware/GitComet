@@ -1363,8 +1363,8 @@ enum WatchSetupOutcome {
     /// worktree is only partially watched.
     Watching { failed_dirs: usize },
     /// Too many non-ignored worktree directories: no source folders are watched (only the workdir
-    /// root); the source tree is left to the `.git` watch + focus-triggered full refresh. Carries
-    /// the subdirectory count for the user-facing warning.
+    /// root); the source tree is left to the `.git` watch + focus-triggered full refresh. `dir_count`
+    /// is the probe length; `capped` is true when the walk stopped early so that count is not exact.
     #[cfg(any(target_os = "linux", test))]
     WorktreeSubdirsSkipped { dir_count: usize, capped: bool },
     /// The workdir root watch failed; the watcher is unusable.
