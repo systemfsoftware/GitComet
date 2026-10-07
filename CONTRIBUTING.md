@@ -71,21 +71,11 @@ This writes:
 
 ### Release packaging
 
-macOS packaging is handled by:
-
-```bash
-scripts/package-macos.sh --version 0.2.0 --arch arm64 --release
-scripts/package-macos.sh --version 0.2.0 --arch x86_64 --release
-```
-
-Use `--skip-dmg` when running in restricted/sandboxed environments where `hdiutil create` is unavailable.
-
 The release workflow `.github/workflows/build-release-artifacts.yml` builds and publishes:
 
 - Windows: portable ZIP + MSI
 - Linux: tar.gz + AppImage + .deb
-- macOS: DMG + tar.gz for `arm64` and `x86_64`
-- Homebrew cask asset: `gitcomet.rb` (generated from macOS DMG artifacts and Linux AppImages plus their SHA256 values)
+- Homebrew cask asset: `gitcomet.rb` (Linux-only, generated from the Linux AppImages plus their SHA256 values)
 
 ### Homebrew deployment
 

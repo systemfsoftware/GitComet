@@ -12,7 +12,7 @@
 
 GitComet is built for teams that want fast Git operations with local-first privacy, familiar workflows, and open source freedom.
 
-Available for Linux, Windows, and macOS.
+Available for Linux and Windows.
 
 <img alt="GitComet demo" src="assets/gitcomet.gif"/>
 
@@ -34,7 +34,7 @@ Install from the Microsoft Store:
 </details>
 
 <details>
-<summary>Homebrew (macOS / Linux)</summary>
+<summary>Homebrew (Linux)</summary>
 
 App and `gitcomet` command from tap:
 
