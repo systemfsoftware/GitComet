@@ -6,20 +6,16 @@ usage() {
 Usage: scripts/generate-homebrew-cask.sh \
   --version VERSION \
   --github-repo OWNER/REPO \
-  --arm-dmg PATH \
-  --intel-dmg PATH \
   --linux-arm-appimage PATH \
   --linux-intel-appimage PATH \
   --output PATH
 
-Generates a Homebrew cask for GitComet from macOS DMG and Linux AppImage artifacts.
+Generates a Linux-only Homebrew cask for GitComet from the Linux AppImage artifacts.
 USAGE
 }
 
 version=""
 github_repo=""
-arm_dmg=""
-intel_dmg=""
 linux_arm_appimage=""
 linux_intel_appimage=""
 out_path=""
@@ -32,14 +28,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --github-repo)
       github_repo="${2:-}"
-      shift 2
-      ;;
-    --arm-dmg)
-      arm_dmg="${2:-}"
-      shift 2
-      ;;
-    --intel-dmg)
-      intel_dmg="${2:-}"
       shift 2
       ;;
     --linux-arm-appimage)
@@ -66,7 +54,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$version" || -z "$github_repo" || -z "$arm_dmg" || -z "$intel_dmg" || -z "$linux_arm_appimage" || -z "$linux_intel_appimage" || -z "$out_path" ]]; then
+if [[ -z "$version" || -z "$github_repo" || -z "$linux_arm_appimage" || -z "$linux_intel_appimage" || -z "$out_path" ]]; then
   echo "All arguments are required." >&2
   usage
   exit 2
@@ -75,16 +63,6 @@ fi
 if ! [[ "$github_repo" =~ ^[^/]+/[^/]+$ ]]; then
   echo "Invalid --github-repo '$github_repo'. Expected OWNER/REPO." >&2
   exit 2
-fi
-
-if [[ ! -f "$arm_dmg" ]]; then
-  echo "arm DMG not found: $arm_dmg" >&2
-  exit 1
-fi
-
-if [[ ! -f "$intel_dmg" ]]; then
-  echo "intel DMG not found: $intel_dmg" >&2
-  exit 1
 fi
 
 if [[ ! -f "$linux_arm_appimage" ]]; then
@@ -111,8 +89,6 @@ sha256_file() {
   exit 1
 }
 
-arm_sha="$(sha256_file "$arm_dmg")"
-intel_sha="$(sha256_file "$intel_dmg")"
 linux_arm_sha="$(sha256_file "$linux_arm_appimage")"
 linux_intel_sha="$(sha256_file "$linux_intel_appimage")"
 
@@ -122,23 +98,7 @@ cat > "$out_path" <<EOF2
 cask "gitcomet" do
   version "${version}"
   arch arm: "arm64", intel: "x86_64"
-  os macos: "macos", linux: "linux"
-
-  on_macos do
-    on_arm do
-      sha256 "${arm_sha}"
-    end
-
-    on_intel do
-      sha256 "${intel_sha}"
-    end
-
-    url "https://github.com/${github_repo}/releases/download/v#{version}/gitcomet-v#{version}-macos-#{arch}.dmg"
-    depends_on macos: :ventura
-
-    app "GitComet.app"
-    binary "#{appdir}/GitComet.app/Contents/MacOS/gitcomet", target: "gitcomet"
-  end
+  os linux: "linux"
 
   on_linux do
     on_arm do
